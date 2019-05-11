@@ -18,12 +18,13 @@
 import torch
 import torchvision
 import tensorrt as trt
+import torch2trt
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
 net = torchvision.models.inception_v3(pretrained=True).eval()
 inputs = torch.rand(1, 3, 299, 299)
 
-with trt.Builder(TRT_LOGGER) as builder, builder.create_network() as network:
+with trt.Builder(TRT_LOGGER) as builder, builder.create_network() as trt_net:
     builder.max_workspace_size = 1 << 30
     # you can use either trt.ITensor or torch.Tensor as inputs.
     # need trt_network to enter tensorrt mode, otherwise pytorch mode
@@ -47,7 +48,7 @@ with trt.Builder(TRT_LOGGER) as builder, builder.create_network() as network:
     """
     # you can add custom post process plugin here...
     trt_net.mark_output(tensor=output_tensor)
-    engine = builder.build_cuda_engine(network)
+    engine = builder.build_cuda_engine(trt_net)
     engine_bin = engine.serialize()
 ```
 
@@ -66,10 +67,9 @@ torch2trt can't convert module with unused weights and buffers. if your module c
 #### Run in pytorch debug mode
 
 ```Python
-import common # from tensorrt samples
+import torch
 import torchvision
-import tensorrt as trt
-
+import torch2trt
 net = torchvision.models.inception_v3(pretrained=True).eval()
 inputs = torch.rand(1, 3, 224, 224)
 with torch2trt.torch_network():
@@ -81,11 +81,11 @@ results = torch2trt.debug_call_graph(graph_pth, inputs)
 
 ### Add new handler
 
-You can add handlers for missing nodes or tensorrt custom plugin.
+You can add handlers for missing nodes or tensorrt custom plugin. see ```handlers/ops.py``` for more examples.
 
 ```Python
 @torch2trt.register_node_handler("aten::sum")
-def aten_sum(inputs, attributes):
+def aten_sum(inputs, attributes, scope):
     inp, axes, keepdim = inputs
     net = torch2trt.current_network()
     if net is not None and torch2trt.has_trt_tensor(inputs):
@@ -93,6 +93,8 @@ def aten_sum(inputs, attributes):
         layer = net.add_reduce(inp, trt.ReduceOperation.SUM, axis_trt,
                                bool(keepdim))
         output = layer.get_output(0)
+        output.name = scope
+        layer.name = scope
         return [output]
     return [inp.sum(tuple(axes), keepdim=bool(keepdim))]
 ```
@@ -106,6 +108,8 @@ def aten_sum(inputs, attributes):
 4. return list of output tensors. all nodes MUST return list or tuple to handle node with multiple outputs.
 
 5. for unsupported operators, write custom tensorrt plugin to handle this, then use net.add_plugin_v2 to add plugin in handler. you should also write custom torch jit operator for debugging. if you don't want to write jit operator, you can call torch2trt with several sub-module and connect them by tensorrt layers.
+
+6. (optional) assign a name to output tensor and layer. the ```scope``` argument of handler is unique.
 
 ## Tips to write TensorRT-compatible modules
 

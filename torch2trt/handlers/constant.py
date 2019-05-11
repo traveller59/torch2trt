@@ -7,24 +7,24 @@ from torch2trt.utils import print_inputs
 
 
 @register_node_handler("prim::Constant")
-def prim_constant(inputs, attributes):
+def prim_constant(inputs, attributes, scope):
     if "value" not in attributes:
         return [None]
     return [attributes["value"]]
 
 
 @register_node_handler("prim::ListConstruct")
-def prim_list_construct(inputs, attributes):
+def prim_list_construct(inputs, attributes, scope):
     return [list(inputs)]
 
 
 @register_node_handler("prim::TupleConstruct")
-def prim_tuple_construct(inputs, attributes):
+def prim_tuple_construct(inputs, attributes, scope):
     return [tuple(inputs)]
 
 
 @register_node_handler("aten::size")
-def aten_size(inputs, attributes):
+def aten_size(inputs, attributes, scope):
     axis = inputs[1]
     net = current_network()
     if net is not None and has_trt_tensor(inputs):
@@ -37,17 +37,17 @@ def aten_size(inputs, attributes):
 
 
 @register_node_handler("prim::NumToTensor")
-def prim_num_to_tensor(inputs, attributes):
+def prim_num_to_tensor(inputs, attributes, scope):
     return [inputs[0]]
 
 
 @register_node_handler("prim::Int")
-def prim_int(inputs, attributes):
+def prim_int(inputs, attributes, scope):
     return [int(inputs[0])]
 
 
 @register_node_handler("aten::to")
-def aten_to(inputs, attributes):
+def aten_to(inputs, attributes, scope):
     inp, dst = inputs[:2]
     net = current_network()
     if net is not None and has_trt_tensor(inputs):
@@ -56,7 +56,7 @@ def aten_to(inputs, attributes):
 
 
 @register_node_handler("aten::detach")
-def aten_detach(inputs, attributes):
+def aten_detach(inputs, attributes, scope):
     inp = inputs[0]
     net = current_network()
     if net is not None and has_trt_tensor(inputs):
@@ -65,7 +65,7 @@ def aten_detach(inputs, attributes):
 
 
 @register_node_handler("aten::t")
-def aten_t(inputs, attributes):
+def aten_t(inputs, attributes, scope):
     inp = inputs[0]
     # weights in nn.Linear use this.
     assert isinstance(inp, torch.Tensor), "don't support this in tensorrt"

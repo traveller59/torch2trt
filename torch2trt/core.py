@@ -16,7 +16,7 @@ from torch.onnx.utils import \
     OperatorExportTypes  # must import this, otherwise error
 from torch.utils.tensorboard._proto_graph import node_proto
 
-from torch2trt.utils import print_inputs
+from torch2trt.utils import print_inputs, pretty_str
 
 methods_OP = [
     'attributeNames', 'hasMultipleOutputs', 'hasUses', 'inputs', 'kind',
@@ -142,6 +142,8 @@ class NodePy(NodeBase):
         valid_methods = valid_methods[:]
         self.inputs = []
         self.resolved_outputs = []
+        self.resolved = False
+        self.readable_unique_name = None
 
         for m in valid_methods:
             if m == 'inputs' or m == 'outputs':
@@ -182,6 +184,7 @@ class NodePyIO(NodePy):
             self.input_or_output = input_or_output
             self.kind = 'IO Node'
         self.resolved_outputs = [None]
+        self.resolved = True
 
 
 class NodePyOP(NodePy):
@@ -221,6 +224,7 @@ class GraphPy(object):
         self.shallowest_scope_name = 'default'
         self.scope_name_appeared = []
         self.output_nodes = []
+        self.readable_name_to_node = {}
 
     def get_output_nodes_dict(self):
         nodes_dict = OrderedDict()
@@ -357,6 +361,18 @@ class GraphPy(object):
                         node.uniqueName]
 
 
+def _make_unique_name(unique_set, name, max_count=10000):
+    if name not in unique_set:
+        unique_set.add(name)
+        return name
+    for i in range(max_count):
+        new_name = name + "_{}".format(i)
+        if new_name not in unique_set:
+            unique_set.add(new_name)
+            return new_name
+    raise ValueError("max count reached")
+
+
 def parse(graph, num_inputs, omit_useless_nodes=False):
     """This method parses an optimized PyTorch model graph and produces
     a list of nodes and node stats for eventual conversion to TensorBoard
@@ -389,6 +405,30 @@ def parse(graph, num_inputs, omit_useless_nodes=False):
         graph_py.output_nodes.append(NodePyIO(node, 'output'))
     graph_py.find_common_root()
     graph_py.populate_namespace_from_OP_to_IO()
+
+    # assign a readable name to each node
+    output_names = graph_py.get_output_names()
+    unique_name_set = set()
+    for output_name in output_names:
+        out_to_node = graph_py.get_out_to_node()
+        out_node = out_to_node[output_name]
+
+        def recursive_assign_name(node: NodePy):
+            if isinstance(node, NodePyOP):
+                if node.readable_unique_name is None:
+                    node.readable_unique_name = _make_unique_name(
+                        unique_name_set, node.scopeName + "/" + node.kind)
+                    graph_py.readable_name_to_node[node.
+                                                   readable_unique_name] = node
+                else:
+                    return
+            else:
+                return
+            for inp_name in node.inputs:
+                recursive_assign_name(out_to_node[inp_name])
+
+        recursive_assign_name(out_node)
+
     return graph_py
 
 
@@ -399,7 +439,7 @@ def _get_jit_params(module, param_exclude, param_include):
     if param_include is not None:
         param_include = re.compile(param_include)
 
-    new_state_dict = {}
+    new_state_dict = OrderedDict()
     for k, v in state_dict.items():
         if param_exclude is not None and param_exclude.match(k) is not None:
             continue
@@ -418,52 +458,49 @@ def resolve_graph(graph_py: GraphPy, output_names, verbose=False):
     if not isinstance(output_names, (list, tuple)):
         output_names = [output_names]
     results = []
-
-    def recursive_resolve(node: NodePy):
-        if all([n is not None for n in node.resolved_outputs]):
-            return node.resolved_outputs
-        inputs = []
-        for inp_name in node.inputs:
-            res = recursive_resolve(out_to_node[inp_name])
-            inputs += [res[out_to_idx[inp_name]]]
-        handler = get_node_handler(node.kind)
-        if verbose:
-            msg = ""
-            in_shapes = []
-            num_tensor = 0
-            for t in inputs:
-                if isinstance(t, (torch.Tensor, trt.ITensor)):
-                    in_shapes.append(tuple(t.shape))
-                    num_tensor += 1
-                else:
-                    in_shapes.append(t)
-            if has_trt_tensor(inputs) or has_torch_tensor(inputs):
-                msg += "{}: [{}]==>>".format(
-                    node.kind, ','.join([str(s) for s in in_shapes]))
-                print(msg, end="\n")
-        results = handler(inputs, node.attributes)
-        assert isinstance(results, (list, tuple)), f"{node.kind}"
-        assert len(results) == len(node.resolved_outputs), f"{node.kind}"
-        if verbose:
-            out_shapes = []
-            num_tensor = 0
-            for t in results:
-                if isinstance(t, (torch.Tensor, trt.ITensor)):
-                    out_shapes.append(tuple(t.shape))
-                    num_tensor += 1
-                else:
-                    out_shapes.append(t)
-
-            if has_trt_tensor(results) or has_torch_tensor(results):
-                print("[{}]".format(','.join([str(s) for s in out_shapes])))
-
-        node.resolved_outputs = list(results)
-        return results
-
     for output_name in output_names:
         out_node = out_to_node[output_name]
-        res = recursive_resolve(out_node)
-        results.append(res)
+        stack = [out_node]
+        while len(stack) > 0:
+            node = stack[-1]
+            if node.resolved:
+                stack.pop()
+                continue
+            inputs = []
+            prepared = True
+            for inp_name in node.inputs:
+                inp_node = out_to_node[inp_name]
+                if not inp_node.resolved:  # node isn't evaluated
+                    stack.append(inp_node)
+                    prepared = False
+                inputs.append(inp_node.resolved_outputs[out_to_idx[inp_name]])
+            if not prepared:
+                continue
+            assert node.readable_unique_name is not None
+            if verbose:
+                msg = ""
+                if (has_trt_tensor(inputs) or has_torch_tensor(inputs)):
+                    msg += "{}==>>".format(pretty_str(inputs))
+            try:
+                handler = get_node_handler(node.kind)
+                results = handler(inputs, node.attributes,
+                                  node.readable_unique_name)
+            except Exception as e:
+                print(node.readable_unique_name)
+                print(msg)
+                raise e
+            assert isinstance(results, (list, tuple)), f"{node.kind}"
+            assert len(results) == len(node.resolved_outputs), f"{node.kind}"
+            if verbose:
+                if ((has_trt_tensor(inputs) or has_torch_tensor(inputs)) and
+                    (has_trt_tensor(results) or has_torch_tensor(results))):
+                    msg += pretty_str(results)
+                    print(node.readable_unique_name)
+                    print(msg)
+            node.resolved_outputs = list(results)
+            node.resolved = True
+            stack.pop()
+        results.append(out_node.resolved_outputs)
     return results
 
 
@@ -548,7 +585,13 @@ def clean_resolved_outputs(graph_py, output_name):
 
     def recursive_resolve(node: NodePy):
         if isinstance(node, NodePyOP):
-            node.resolved_outputs = [None] * len(node.resolved_outputs)
+            if node.resolved is True:
+                node.resolved_outputs = [None] * len(node.resolved_outputs)
+                node.resolved = False
+            else:
+                return
+        else:
+            return
         for inp_name in node.inputs:
             recursive_resolve(out_to_node[inp_name])
 
