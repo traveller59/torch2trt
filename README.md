@@ -26,8 +26,10 @@ inputs = torch.rand(1, 3, 299, 299)
 with trt.Builder(TRT_LOGGER) as builder, builder.create_network() as network:
     builder.max_workspace_size = 1 << 30
     # you can use either trt.ITensor or torch.Tensor as inputs.
-    with torch2trt.core.trt_network(trt_net):
-        trace, graph_pth = torch2trt.core.torch2trt(net, inputs, input_names=["image"], verbose=True, param_exclude=".*AuxLogits.*")
+    # need trt_network to enter tensorrt mode, otherwise pytorch mode
+    with torch2trt.trt_network(trt_net): 
+        trace, graph_pth = torch2trt.torch2trt(net, inputs, input_names=["image"], 
+            verbose=True, param_exclude=".*AuxLogits.*")
     results = graph_pth.get_resolved_outputs()
     print(results)
     output_tensor = results[0][0]
@@ -36,8 +38,9 @@ with trt.Builder(TRT_LOGGER) as builder, builder.create_network() as network:
     # plugin = net.add_plugin_v2(...) # add unsupported operator
     # output_tensor = plugin.get_output(0)
     """
-    with torch2trt.core.trt_network(trt_net):
-        trace, graph_pth = torch2trt.core.torch2trt(other_net, output_tensor, input_names=["other_input"], verbose=True, param_exclude=".*AuxLogits.*")
+    with torch2trt.trt_network(trt_net):
+        trace, graph_pth = torch2trt.torch2trt(other_net, output_tensor, 
+            input_names=["other_input"], verbose=True, param_exclude=".*AuxLogits.*")
     results = graph_pth.get_resolved_outputs()
     output_tensor = results[0][0]
     output_tensor.name = "output2"
@@ -62,29 +65,30 @@ torch2trt can't convert module with unused weights and buffers. if your module c
 
 #### Run in pytorch debug mode
 
-```
+```Python
 import common # from tensorrt samples
 import torchvision
 import tensorrt as trt
 
 net = torchvision.models.inception_v3(pretrained=True).eval()
 inputs = torch.rand(1, 3, 224, 224)
-with torch2trt.core.torch_network():
-    trace, graph_pth = torch2trt.core.torch2trt(net, inputs, verbose=True, param_exclude=".*AuxLogits.*")
-
-results = torch2trt.core.debug_call_graph(graph_pth, inputs)
+with torch2trt.torch_network():
+    trace, graph_pth = torch2trt.torch2trt(net, inputs, verbose=True, param_exclude=".*AuxLogits.*")
+print(graph_pth.get_resolved_outputs())
+# if you want to debug graph with other inputs, use debug_call_graph
+results = torch2trt.debug_call_graph(graph_pth, inputs)
 ```
 
 ### Add new handler
 
 You can add handlers for missing nodes or tensorrt custom plugin.
 
-```
-@register_node_handler("aten::sum")
+```Python
+@torch2trt.register_node_handler("aten::sum")
 def aten_sum(inputs, attributes):
     inp, axes, keepdim = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    net = torch2trt.current_network()
+    if net is not None and torch2trt.has_trt_tensor(inputs):
         axis_trt = _axes_to_trt_axis(axes, len(inp.shape))
         layer = net.add_reduce(inp, trt.ReduceOperation.SUM, axis_trt,
                                bool(keepdim))
@@ -104,6 +108,10 @@ def aten_sum(inputs, attributes):
 5. for unsupported operators, write custom tensorrt plugin to handle this, then use net.add_plugin_v2 to add plugin in handler. you should also write custom torch jit operator for debugging. if you don't want to write jit operator, you can call torch2trt with several sub-module and connect them by tensorrt layers.
 
 ## Tips to write TensorRT-compatible modules
+
+* inputs and outputs of net.forward can't be dict.
+
+* tensorrt don't support type cast for now. all data should be float. avoid to use operations such as "to" and "type_as"
 
 * all operations MUST use a static batch size.
 

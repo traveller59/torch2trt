@@ -18,8 +18,6 @@ from torch.utils.tensorboard._proto_graph import node_proto
 
 from torch2trt.utils import print_inputs
 
-# import tensorrt as trt
-
 methods_OP = [
     'attributeNames', 'hasMultipleOutputs', 'hasUses', 'inputs', 'kind',
     'outputs', 'outputsSize', 'scopeName'
@@ -478,12 +476,13 @@ def torch2trt(module,
               input_names=None,
               verbose=False):
     """main entry point of torch2trt.
+
     Args:
         module: pytorch nn.Module or function.
         example_inputs: list or tuple of example tensors. MUST match arguments of 
             forward function of module.
-        param_exclude: regex string. filter unused weights and buffers.
-        param_include: regex string. filter unused weights and buffers.
+        param_exclude: regex string. filter unused weights and buffers if match.
+        param_include: regex string. filter unused weights and buffers if not match.
         output_names: list of string. indicate output node name you want to use.
             note that pytorch jit node name don't contains any readable information.
             so I recommend not use this.
@@ -492,7 +491,7 @@ def torch2trt(module,
         input_names: list of string. MUST provided when run in trt mode. not required
             in pytorch debug mode.
         verbose: bool. 
-    Returns
+    Returns:
         trace: traced jit module or function. MUST returned to avoid some C++ error.
         graph_pth: GraphPy object. use this to access pytorch graph and get
             resolved output tensors.
@@ -517,8 +516,9 @@ def torch2trt(module,
             pnode.resolved_outputs[0] = param
     net = current_network()
     if net is not None:
-        assert input_names is not None, "trt must provide input name"
-        assert isinstance(input_names, (list, tuple))
+        assert input_names is not None, "trt mode must provide input name"
+        if not isinstance(input_names, (list, tuple)):
+            input_names = [input_names]
         assert len(input_names) == len(example_inputs)
         inputs = []
         if input_tensors is not None:
