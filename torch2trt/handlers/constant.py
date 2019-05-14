@@ -2,7 +2,7 @@ import tensorrt as trt
 import torch
 
 from torch2trt.core import (current_network, has_trt_tensor,
-                                         register_node_handler)
+                            register_node_handler)
 from torch2trt.utils import print_inputs
 
 

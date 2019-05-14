@@ -291,9 +291,12 @@ class GraphPy(object):
         """
         res = []
         out_to_node = self.get_out_to_node()
+        out_to_idx = self.get_out_to_idx()
         for name in self.get_output_names():
-            res.append(out_to_node[name].resolved_outputs)
-        return res
+            res.append(out_to_node[name].resolved_outputs[out_to_idx[name]])
+        if len(res) == 1:
+            return res[0]
+        return tuple(res)
 
     def append(self, x):
         if isinstance(x, NodePyIO):
@@ -487,7 +490,8 @@ def resolve_graph(graph_py: GraphPy, output_names, verbose=False):
                                   node.readable_unique_name)
             except Exception as e:
                 print(node.readable_unique_name)
-                print(msg)
+                if verbose:
+                    print(msg)
                 raise e
             assert isinstance(results, (list, tuple)), f"{node.kind}"
             assert len(results) == len(node.resolved_outputs), f"{node.kind}"
@@ -559,6 +563,8 @@ def torch2trt(module,
         assert len(input_names) == len(example_inputs)
         inputs = []
         if input_tensors is not None:
+            if not isinstance(input_tensors, (list, tuple)):
+                input_tensors = [input_tensors]
             assert len(input_tensors) == len(example_inputs)
             inputs = input_tensors
         else:
@@ -598,16 +604,61 @@ def clean_resolved_outputs(graph_py, output_name):
     recursive_resolve(out_node)
 
 
-def debug_call_graph(graph_py, inputs, output_names=None):
-    assert current_network() is None, "must run in pytorch debug mode"
-    if output_names is None:
-        output_names = graph_py.get_output_names()
-    if not isinstance(inputs, (list, tuple)):
-        inputs = [inputs]
-    if not isinstance(output_names, (list, tuple)):
-        output_names = [output_names]
-    for output_name in output_names:
-        clean_resolved_outputs(graph_py, output_name)
-    for i, inode in enumerate(graph_py.get_input_nodes_dict().values()):
-        inode.resolved_outputs[0] = inputs[i]
-    return resolve_graph(graph_py, output_names)
+class GraphModule:
+    """main entry class of torch2trt.
+    Args:
+        module: pytorch nn.Module or function.
+        example_inputs: list or tuple of example tensors. MUST match arguments of 
+            forward function of module.
+        param_exclude: regex string. filter unused weights and buffers if match.
+        param_include: regex string. filter unused weights and buffers if not match.
+    """
+    def __init__(self,
+                 module,
+                 example_inputs,
+                 param_exclude=None,
+                 param_include=None):
+
+        super().__init__()
+        self.module = module
+        trace = torch.jit.trace(module, example_inputs, True)
+        if not isinstance(example_inputs, (list, tuple)):
+            example_inputs = [example_inputs]
+        graph_py = parse(
+            trace.graph, len(example_inputs), omit_useless_nodes=False)
+        self.graph = graph_py
+        self.trace = trace
+        self.param_exclude = param_exclude
+        self.param_include = param_include
+        self.example_inputs = example_inputs
+
+        msg = "input mismatch. this may due to some input isn't used in graph"
+        assert len(example_inputs) == len(graph_py.get_input_nodes_dict()), msg
+        if isinstance(module, torch.nn.Module):
+            params = _get_jit_params(module, param_exclude, param_include)
+            num_param_inputs = len(graph_py.get_param_nodes())
+            msg = "expected {} params, but get {} params. ".format(
+                num_param_inputs, len(params))
+            msg += "This may due to your network have multi output. use param_exclude to remove them"
+            assert len(params) == num_param_inputs, msg
+            for pnode, param in zip(graph_py.get_param_nodes(), params):
+                pnode.resolved_outputs[0] = param
+
+    def __call__(self, *args, verbose=False, **kw):
+        assert len(kw) == 0, "don't support kw arg"
+        assert all([isinstance(e, (torch.Tensor, trt.ITensor)) for e in args])
+        assert len(args) == len(self.graph.get_input_nodes_dict())
+        output_names = self.graph.get_output_names()
+        for output_name in output_names:
+            clean_resolved_outputs(self.graph, output_name)
+        for i, inode in enumerate(self.graph.get_input_nodes_dict().values()):
+            inode.resolved_outputs[0] = args[i]
+        if has_trt_tensor(args):
+            # trt mode
+            assert all([isinstance(e, trt.ITensor) for e in args])
+            assert isinstance(current_network(), trt.INetworkDefinition)
+        else:
+            assert all([isinstance(e, torch.Tensor) for e in args])
+            assert current_network() is None, "you should run pytorch mode outside trt_network block"
+        resolve_graph(self.graph, output_names, verbose)
+        return self.graph.get_resolved_outputs()

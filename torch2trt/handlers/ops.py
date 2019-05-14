@@ -4,7 +4,7 @@ import torch
 from torch.nn import functional as F
 
 from torch2trt.core import (current_network, has_trt_tensor,
-                                         register_node_handler)
+                            register_node_handler)
 from torch2trt.utils import print_inputs
 
 
@@ -54,10 +54,10 @@ def aten_convolution(inputs, attributes, scope):
             bias = trt.Weights()
         if transposed:
             layer = net.add_deconvolution(inputs[0], O, tuple(ksize), weight,
-                                         bias)
+                                          bias)
         else:
             layer = net.add_convolution(inputs[0], O, tuple(ksize), weight,
-                                       bias)
+                                        bias)
             layer.dilation = tuple(dilation)
         layer.stride = tuple(stride)
         layer.padding = tuple(pad)
@@ -90,7 +90,7 @@ def aten_batch_norm(inputs, attributes, scope):
         shift = (-running_mean / np.sqrt(running_var + eps)) * weight + bias
         scale = weight / np.sqrt(running_var + eps)
         layer = net.add_scale(inp, trt.ScaleMode.CHANNEL, shift, scale,
-                           np.ones_like(shift))
+                              np.ones_like(shift))
         output = layer.get_output(0)
         output.name = scope
         layer.name = scope
@@ -98,30 +98,6 @@ def aten_batch_norm(inputs, attributes, scope):
     res = F.batch_norm(inp, running_mean, running_var, weight, bias,
                        bool(training), momentum, eps)
     return [res]
-
-
-@register_node_handler("aten::relu_")
-def aten_relu_(inputs, attributes, scope):
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
-        layer = net.add_activation(inputs[0], trt.ActivationType.RELU)
-        output = layer.get_output(0)
-        output.name = scope
-        layer.name = scope
-        return [output]
-    return [F.relu_(inputs[0])]
-
-
-@register_node_handler("aten::relu")
-def aten_relu(inputs, attributes, scope):
-    net = current_network()
-    if net is not None:
-        layer = net.add_activation(inputs[0], trt.ActivationType.RELU)
-        output = layer.get_output(0)
-        output.name = scope
-        layer.name = scope
-        return [output]
-    return [F.relu(inputs[0])]
 
 
 @register_node_handler("aten::max_pool2d")
@@ -314,7 +290,8 @@ def aten_select(inputs, attributes, scope):
     net = current_network()
     if net is not None and has_trt_tensor(inputs):
         assert dim > 0
-        output = _trt_torch_slice(net, inp, dim, index, index + 1, 1, scope + "/slice")
+        output = _trt_torch_slice(net, inp, dim, index, index + 1, 1,
+                                  scope + "/slice")
         output.name = scope + "/slice"
         output = _trt_squeeze(net, output, dim, scope + "/squeeze")
         output.name = scope + "/squeeze"
@@ -474,6 +451,8 @@ def _axes_to_trt_axis(axes, ndim):
     bit = np.array(1, dtype=np.uint32)
     res = np.array(0, dtype=np.uint32)
     for ax in axes:
+        if ax == -1:
+            ax = ndim
         assert ax > 0
         res = np.bitwise_or(res, bit << (ax - 1))
     return int(res)
@@ -507,6 +486,51 @@ def aten_max(inputs, attributes, scope):
         output.name = scope
         return [output, None]
     return [*inp.max(dim, keepdim=bool(keepdim))]
+
+
+@register_node_handler("aten::min")
+def aten_min(inputs, attributes, scope):
+    inp, dim, keepdim = inputs
+    net = current_network()
+    if net is not None and has_trt_tensor(inputs):
+        axis_trt = _axes_to_trt_axis([dim], len(inp.shape))
+        layer = net.add_reduce(inp, trt.ReduceOperation.MIN, axis_trt,
+                               bool(keepdim))
+        output = layer.get_output(0)
+        layer.name = scope
+        output.name = scope
+        return [output, None]
+    return [*inp.min(dim, keepdim=bool(keepdim))]
+
+
+@register_node_handler("aten::mean")
+def aten_mean(inputs, attributes, scope):
+    inp, dim, keepdim = inputs
+    net = current_network()
+    if net is not None and has_trt_tensor(inputs):
+        axis_trt = _axes_to_trt_axis([dim], len(inp.shape))
+        layer = net.add_reduce(inp, trt.ReduceOperation.AVG, axis_trt,
+                               bool(keepdim))
+        output = layer.get_output(0)
+        layer.name = scope
+        output.name = scope
+        return [output, None]
+    return [*inp.mean(dim, keepdim=bool(keepdim))]
+
+
+@register_node_handler("aten::prod")
+def aten_prod(inputs, attributes, scope):
+    inp, dim, keepdim = inputs
+    net = current_network()
+    if net is not None and has_trt_tensor(inputs):
+        axis_trt = _axes_to_trt_axis([dim], len(inp.shape))
+        layer = net.add_reduce(inp, trt.ReduceOperation.PROD, axis_trt,
+                               bool(keepdim))
+        output = layer.get_output(0)
+        layer.name = scope
+        output.name = scope
+        return [output, None]
+    return [*inp.prod(dim, keepdim=bool(keepdim))]
 
 
 @register_node_handler("aten::permute")
@@ -546,3 +570,32 @@ def aten_constant_pad_nd(inputs, attributes, scope):
         layer.name = scope
         return [output]
     return [F.pad(inp, pad_params, value=val)]
+
+
+@register_node_handler("aten::softmax")
+def aten_softmax(inputs, attributes, scope):
+    inp, axis = inputs
+    net = current_network()
+    if net is not None and has_trt_tensor(inputs):
+        axes_trt = _axes_to_trt_axis([axis], len(inp.shape))
+        layer = net.add_softmax(inp)
+        layer.axes = axes_trt
+        output = layer.get_output(0)
+        output.name = scope
+        layer.name = scope
+        return [output]
+    return [F.softmax(inp, axis)]
+
+
+@register_node_handler("aten::index_select")
+def aten_index_select(inputs, attributes, scope):
+    inp, axis, index = inputs
+    net = current_network()
+    if net is not None and has_trt_tensor(inputs):
+        raise NotImplementedError
+        layer = net.add_gather(inp, index, axis - 1)
+        output = layer.get_output(0)
+        output.name = scope
+        layer.name = scope
+        return [output]
+    return [torch.index_select(inp, axis, index)]

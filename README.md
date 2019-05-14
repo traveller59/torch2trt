@@ -12,7 +12,6 @@
 
 ### Basic Example
 
-#### Run in TensorRT mode
 
 ```Python
 import torch
@@ -23,31 +22,30 @@ TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
 net = torchvision.models.inception_v3(pretrained=True).eval()
 inputs = torch.rand(1, 3, 299, 299)
+graph_pth = torch2trt.GraphModule(net, inputs, param_exclude=".*AuxLogits.*")
+# run in pytorch debug mode, like torch_net(...)
+torch_mode_out = graph_pth(inputs)
+# you can convert another module or function:
+def toy_example(x):
+    return torch.softmax(x, 1), torch.sigmoid(x)
+graph_pth_toy = torch2trt.GraphModule(toy_example, torch_mode_out)
+probs, sigmoid = graph_pth_toy(torch_mode_out, verbose=True)
 
 with trt.Builder(TRT_LOGGER) as builder, builder.create_network() as trt_net:
     builder.max_workspace_size = 1 << 30
     # you can use either trt.ITensor or torch.Tensor as inputs.
     # need trt_network to enter tensorrt mode, otherwise pytorch mode
-    with torch2trt.trt_network(trt_net): 
-        trace, graph_pth = torch2trt.torch2trt(net, inputs, input_names=["image"], 
-            verbose=True, param_exclude=".*AuxLogits.*")
-    results = graph_pth.get_resolved_outputs()
-    print(results)
-    output_tensor = results[0][0]
-    output_tensor.name = "output"
-    # you can convert another module:
-    # plugin = net.add_plugin_v2(...) # add unsupported operator
-    # output_tensor = plugin.get_output(0)
-    """
-    with torch2trt.trt_network(trt_net):
-        trace, graph_pth = torch2trt.torch2trt(other_net, output_tensor, 
-            input_names=["other_input"], verbose=True, param_exclude=".*AuxLogits.*")
-    results = graph_pth.get_resolved_outputs()
-    output_tensor = results[0][0]
-    output_tensor.name = "output2"
-    """
-    # you can add custom post process plugin here...
-    trt_net.mark_output(tensor=output_tensor)
+    with torch2trt.trt_network(trt_net): # must use this to enter trt mode
+        img = trt_net.add_input(name="image", shape=[3, 299, 299], dtype=trt.float32)
+        trt_mode_out = graph_pth(img, verbose=True) # call graph_pth like torch module call
+        # plugin = net.add_plugin_v2(trt_mode_out, ...) # add custom operator
+        # trt_mode_out = plugin.get_output(0)
+        # use another module here:
+        trt_mode_out, sigmoid = graph_pth_toy(trt_mode_out)
+    trt_mode_out.name = "output_softmax"
+    sigmoid.name = "output_sigmoid"
+    trt_net.mark_output(tensor=trt_mode_out)
+    trt_net.mark_output(tensor=sigmoid)
     engine = builder.build_cuda_engine(trt_net)
     engine_bin = engine.serialize()
 ```
@@ -56,28 +54,9 @@ with trt.Builder(TRT_LOGGER) as builder, builder.create_network() as trt_net:
 
 Inputs is inputs of net.forward, Outputs is outputs of net.forward.
 
-* ```get_resolved_outputs```
-
-return list of output for every output node.
-
-* ```param_exclude```
+* ```param_exclude``` and ```param_include```
 
 torch2trt can't convert module with unused weights and buffers. if your module contains them, you need to use regex string to filter them.
-
-#### Run in pytorch debug mode
-
-```Python
-import torch
-import torchvision
-import torch2trt
-net = torchvision.models.inception_v3(pretrained=True).eval()
-inputs = torch.rand(1, 3, 224, 224)
-with torch2trt.torch_network():
-    trace, graph_pth = torch2trt.torch2trt(net, inputs, verbose=True, param_exclude=".*AuxLogits.*")
-print(graph_pth.get_resolved_outputs())
-# if you want to debug graph with other inputs, use debug_call_graph
-results = torch2trt.debug_call_graph(graph_pth, inputs)
-```
 
 ### Add new handler
 
