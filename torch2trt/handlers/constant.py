@@ -30,7 +30,7 @@ def aten_size(inputs, attributes, scope):
     if net is not None and has_trt_tensor(inputs):
         # trt tensor shape don't include batch axis
         if axis == 0:
-            return [None]
+            return [-1]
         else:
             return [inputs[0].shape[inputs[1] - 1]]
     return [inputs[0].shape[inputs[1]]]
