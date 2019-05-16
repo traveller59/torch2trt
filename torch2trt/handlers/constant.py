@@ -30,7 +30,7 @@ def aten_size(inputs, attributes, scope):
     if net is not None and has_trt_tensor(inputs):
         # trt tensor shape don't include batch axis
         if axis == 0:
-            return [-1]
+            return [None]
         else:
             return [inputs[0].shape[inputs[1] - 1]]
     return [inputs[0].shape[inputs[1]]]
@@ -70,3 +70,9 @@ def aten_t(inputs, attributes, scope):
     # weights in nn.Linear use this.
     assert isinstance(inp, torch.Tensor), "don't support this in tensorrt"
     return [inputs[0].t()]
+
+
+@register_node_handler("prim::ListUnpack")
+def prim_list_unpack(inputs, attributes, scope):
+    inp = inputs[0]
+    return [*inputs[0]]

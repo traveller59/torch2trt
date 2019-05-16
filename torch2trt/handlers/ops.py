@@ -186,6 +186,8 @@ def aten_addmm(inputs, attributes, scope):
         bias = mat_to_add.detach().cpu().numpy()
         C = weight.shape[0]
         # use fc to implement this
+        if len(inp.shape) < 3:
+            inp = _trt_reshape(net, inp, [-1, 1, 1], scope + "/reshape")
         layer = net.add_fully_connected(inp, C, weight, bias)
         output = layer.get_output(0)
         output.name = scope
@@ -268,6 +270,14 @@ def _trt_unsqueeze(net, inp, dim, name):
     assert dim > 0
     shape = list(inp.shape)
     shape.insert(dim - 1, 1)
+    layer = net.add_shuffle(inp)
+    layer.reshape_dims = shape
+    output = layer.get_output(0)
+    layer.name = name
+    return output
+
+
+def _trt_reshape(net, inp, shape, name):
     layer = net.add_shuffle(inp)
     layer.reshape_dims = shape
     output = layer.get_output(0)
@@ -463,14 +473,16 @@ def aten_sum(inputs, attributes, scope):
     inp, axes, keepdim = inputs
     net = current_network()
     if net is not None and has_trt_tensor(inputs):
-        axis_trt = _axes_to_trt_axis(axes, len(inp.shape))
+        if not isinstance(dim, list):
+            dim = [dim]
+        axis_trt = _axes_to_trt_axis(dim, len(inp.shape))
         layer = net.add_reduce(inp, trt.ReduceOperation.SUM, axis_trt,
                                bool(keepdim))
         output = layer.get_output(0)
         output.name = scope
         layer.name = scope
         return [output]
-    return [inp.sum(tuple(axes), keepdim=bool(keepdim))]
+    return [inp.sum(axes, keepdim=bool(keepdim))]
 
 
 @register_node_handler("aten::max")
@@ -478,7 +490,9 @@ def aten_max(inputs, attributes, scope):
     inp, dim, keepdim = inputs
     net = current_network()
     if net is not None and has_trt_tensor(inputs):
-        axis_trt = _axes_to_trt_axis([dim], len(inp.shape))
+        if not isinstance(dim, list):
+            dim = [dim]
+        axis_trt = _axes_to_trt_axis(dim, len(inp.shape))
         layer = net.add_reduce(inp, trt.ReduceOperation.MAX, axis_trt,
                                bool(keepdim))
         output = layer.get_output(0)
@@ -493,7 +507,9 @@ def aten_min(inputs, attributes, scope):
     inp, dim, keepdim = inputs
     net = current_network()
     if net is not None and has_trt_tensor(inputs):
-        axis_trt = _axes_to_trt_axis([dim], len(inp.shape))
+        if not isinstance(dim, list):
+            dim = [dim]
+        axis_trt = _axes_to_trt_axis(dim, len(inp.shape))
         layer = net.add_reduce(inp, trt.ReduceOperation.MIN, axis_trt,
                                bool(keepdim))
         output = layer.get_output(0)
@@ -508,14 +524,16 @@ def aten_mean(inputs, attributes, scope):
     inp, dim, keepdim = inputs
     net = current_network()
     if net is not None and has_trt_tensor(inputs):
-        axis_trt = _axes_to_trt_axis([dim], len(inp.shape))
+        if not isinstance(dim, list):
+            dim = [dim]
+        axis_trt = _axes_to_trt_axis(dim, len(inp.shape))
         layer = net.add_reduce(inp, trt.ReduceOperation.AVG, axis_trt,
                                bool(keepdim))
         output = layer.get_output(0)
         layer.name = scope
         output.name = scope
-        return [output, None]
-    return [*inp.mean(dim, keepdim=bool(keepdim))]
+        return [output]
+    return [inp.mean(dim, keepdim=bool(keepdim))]
 
 
 @register_node_handler("aten::prod")
@@ -529,8 +547,8 @@ def aten_prod(inputs, attributes, scope):
         output = layer.get_output(0)
         layer.name = scope
         output.name = scope
-        return [output, None]
-    return [*inp.prod(dim, keepdim=bool(keepdim))]
+        return [output]
+    return [inp.prod(dim, keepdim=bool(keepdim))]
 
 
 @register_node_handler("aten::permute")
@@ -547,6 +565,42 @@ def aten_permute(inputs, attributes, scope):
         layer.name = scope
         return [output]
     return [inputs[0].permute(*params)]
+
+
+@register_node_handler("aten::transpose")
+def aten_transpose(inputs, attributes, scope):
+    inp, dim0, dim1 = inputs
+    net = current_network()
+    if net is not None and has_trt_tensor(inputs):
+        assert all([p > 0 for p in [dim0, dim1]])
+        params = list(range(len(inp.shape)))
+        tmp = params[dim1 - 1]
+        params[dim1 - 1] = params[dim0 - 1]
+        params[dim0 - 1] = tmp
+        layer = net.add_shuffle(inp)
+        layer.first_transpose = tuple(params)
+        output = layer.get_output(0)
+        output.name = scope
+        layer.name = scope
+        return [output]
+    return [torch.transpose(inputs[0], dim0, dim1)]
+
+
+@register_node_handler("aten::chunk")
+def aten_chunk(inputs, attributes, scope):
+    inp, chunk, dim = inputs
+    net = current_network()
+    if net is not None and has_trt_tensor(inputs):
+        assert dim > 0
+        # use slice to implement chunk
+        outputs = []
+        step = inp.shape[dim - 1] // chunk
+        for i in range(chunk):
+            out = _trt_torch_slice(net, inp, dim, i * step, (i + 1) * step, 1,
+                                   scope + "/slice_{}".format(i))
+            outputs.append(out)
+        return [outputs]
+    return [torch.chunk(inputs[0], chunk, dim)]
 
 
 @register_node_handler("aten::contiguous")
@@ -592,10 +646,36 @@ def aten_index_select(inputs, attributes, scope):
     inp, axis, index = inputs
     net = current_network()
     if net is not None and has_trt_tensor(inputs):
-        raise NotImplementedError
         layer = net.add_gather(inp, index, axis - 1)
         output = layer.get_output(0)
         output.name = scope
         layer.name = scope
         return [output]
     return [torch.index_select(inp, axis, index)]
+
+
+@register_node_handler("aten::repeat")
+def aten_repeat(inputs, attributes, scope):
+    inp, params = inputs
+    net = current_network()
+    if net is not None and has_trt_tensor(inputs):
+        assert params[0] == 1
+        assert len(params) > 1
+        assert len(params) == len(inp.shape) + 1
+        # implement repeat by several gather operation, slower than native repeat
+        i = 0
+        for p, s in zip(params[1:], inp.shape):
+            if p > 1:
+                repeat_weights = np.tile(np.arange(0, s), [p]).astype(np.int32)
+                layer = net.add_constant([1, s * p],
+                                         trt.Weights(repeat_weights))
+                layer.name = scope + "/" + "constant_{}".format(i)
+                gather_inds = layer.get_output(0)
+                gather_inds.name = scope + "/" + "constant_{}".format(i)
+                layer = net.add_gather(inp, gather_inds, i)
+                layer.name = scope + "/" + "gather_{}".format(i)
+                out = layer.get_output(0)
+                out.name = scope + "/" + "gather_{}".format(i)
+            i += 1
+        return [out]
+    return [inp.repeat(*params)]

@@ -14,7 +14,6 @@ import torch
 from torch.jit import _unique_state_dict
 from torch.onnx.utils import \
     OperatorExportTypes  # must import this, otherwise error
-from torch.utils.tensorboard._proto_graph import node_proto
 
 from torch2trt.utils import print_inputs, pretty_str
 
@@ -419,10 +418,13 @@ def parse(graph, num_inputs, omit_useless_nodes=False):
         def recursive_assign_name(node: NodePy):
             if isinstance(node, NodePyOP):
                 if node.readable_unique_name is None:
+                    if node.scopeName != "":
+                        name = node.scopeName + "/" + node.kind
+                    else:
+                        name = node.kind
                     node.readable_unique_name = _make_unique_name(
-                        unique_name_set, node.scopeName + "/" + node.kind)
-                    graph_py.readable_name_to_node[node.
-                                                   readable_unique_name] = node
+                        unique_name_set, name)
+                    graph_py.readable_name_to_node[name] = node
                 else:
                     return
             else:
