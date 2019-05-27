@@ -470,7 +470,7 @@ def _axes_to_trt_axis(axes, ndim):
 
 @register_node_handler("aten::sum")
 def aten_sum(inputs, attributes, scope):
-    inp, axes, keepdim = inputs
+    inp, dim, keepdim = inputs
     net = current_network()
     if net is not None and has_trt_tensor(inputs):
         if not isinstance(dim, list):
@@ -482,7 +482,7 @@ def aten_sum(inputs, attributes, scope):
         output.name = scope
         layer.name = scope
         return [output]
-    return [inp.sum(axes, keepdim=bool(keepdim))]
+    return [inp.sum(dim, keepdim=bool(keepdim))]
 
 
 @register_node_handler("aten::max")

@@ -18,6 +18,7 @@ import torch
 import torchvision
 import tensorrt as trt
 import torch2trt
+import numpy as np 
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
 net = torchvision.models.inception_v3(pretrained=True).eval()
@@ -46,8 +47,51 @@ with trt.Builder(TRT_LOGGER) as builder, builder.create_network() as trt_net:
     sigmoid.name = "output_sigmoid"
     trt_net.mark_output(tensor=trt_mode_out)
     trt_net.mark_output(tensor=sigmoid)
-    engine = builder.build_cuda_engine(trt_net)
-    engine_bin = engine.serialize()
+    with builder.build_cuda_engine(trt_net) as engine:
+        engine_bin = engine.serialize()
+        with open("engine.bin", "wb") as f:
+            f.write(engine_bin)
+# get torch output for comparsion
+# we need to execute some cuda functions before using TorchInferenceContext
+probs, sigmoid = graph_pth_toy(torch_mode_out.cuda())
+probs = probs.cpu().detach().numpy()
+sigmoid = sigmoid.cpu().detach().numpy()
+with trt.Runtime(TRT_LOGGER) as runtime:
+    with open("engine.bin", "rb") as f:
+        engine_bin = f.read()
+
+    with runtime.deserialize_cuda_engine(engine_bin) as engine:
+        with engine.create_execution_context() as trt_ctx:
+            ctx = torch2trt.InferenceContext(trt_ctx)
+            # all inputs are np.array, all inputs will be copied to page-locked host memory.
+            output_dict = ctx.inference_async(inputs.cpu().detach().numpy())
+            # sync inference and kwargs support. sync inference should only
+            # be used in profiling
+            output_dict = ctx.inference(image=inputs.cpu().detach().numpy())
+            # start with tensorrt 5.0.2.6, tensorrt may not keep order of outputs.
+            # so we must use name to get output
+            # all outputs are numpy array
+            output_softmax = output_dict["output_softmax"]
+            output_sigmoid = output_dict["output_sigmoid"]
+            print(np.linalg.norm(output_softmax.reshape(-1) - probs.reshape(-1)))
+            print(np.linalg.norm(output_sigmoid.reshape(-1) - sigmoid.reshape(-1)))
+
+            # now we use a inference class designed for pytorch:
+            ctx = torch2trt.TorchInferenceContext(trt_ctx)
+            # directly take a torch cuda tensor, have no host to device and device to host overhead.
+            # WARNING: currently only support input tensor in device("cuda:0") and default cuda context
+            # all output tensor are in device("cuda:0") too.
+            # WARNING: don't support torch stream because we can't get handle of torch stream.
+            # WARNING: don't support sync inference
+            inputs = inputs.cuda()
+            torch.cuda.synchronize() # do we need to synchronize default stream since we use custom stream?
+            output_dict = ctx.inference_async(inputs)
+            # all outputs are torch cuda tensor (shape maybe different from torch origin output)
+            # all outputs are guaranteed to be synchronized.
+            output_softmax = output_dict["output_softmax"]
+            output_sigmoid = output_dict["output_sigmoid"]
+            print(np.linalg.norm(output_softmax.cpu().detach().numpy().reshape(-1) - probs.reshape(-1)))
+            print(np.linalg.norm(output_sigmoid.cpu().detach().numpy().reshape(-1) - sigmoid.reshape(-1)))
 ```
 
 * Inputs and Outputs of TensorRT network
@@ -107,3 +151,11 @@ def aten_sum(inputs, attributes, scope):
 * don't add unused modules with weights to nn.Module. if you can't modify module code, use ```param_exclude``` in torch2trt to remove them.
 
 * if your custom module have weights, you MUST use name contains "weight" or "bias", otherwise these weights will be filtered and cause error.
+
+## Roadmap
+
+- [ ] Deep integration between tensorrt and pytorch
+  - [ ] Add a TensorRTModule to support train in pytorch, eval in tensorrt
+- [ ] Deep integration between tvm and pytorch
+  - [ ] Add TVM support
+  - [ ] Add a TVMModule to support train in pytorch, eval in tvm (maybe impossible)
