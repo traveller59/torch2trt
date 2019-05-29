@@ -3,16 +3,56 @@ import tensorrt as trt
 import torch
 from torch.nn import functional as F
 
-from torch2trt.core import (current_network, has_trt_tensor,
+from torch2trt.core import (current_context, has_trt_tensor, has_tvm_tensor,
                             register_node_handler)
 from torch2trt.utils import print_inputs
+
+try:
+    import tvm
+    from tvm.relay import expr as _expr
+    from tvm.relay import op as _op
+    from tvm.relay import ir_pass
+    from tvm import nd as _nd
+
+except ImportError:
+    pass
+
+
+def _tvm_shape(tensor):
+    inp_shape = ir_pass.infer_type(tensor).checked_type.shape
+    inp_shape = [int(i) for i in inp_shape]
+    return inp_shape
+
+
+def _tvm_dtype(tensor):
+    inp_dtype = ir_pass.infer_type(tensor).checked_type.dtype
+    return inp_dtype
+
+
+@register_node_handler("aten::size")
+def aten_size(inputs, attributes, scope):
+    axis = inputs[1]
+    ctx = current_context()
+    net = current_context().network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
+        # trt tensor shape don't include batch axis
+        if axis == 0:
+            return [-1
+                    ]  # can't be None because prim::Int may take this result.
+        else:
+            return [inputs[0].shape[inputs[1] - 1]]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        inp_shape = _tvm_shape(inputs[0])
+        return [inp_shape[axis]]
+    return [inputs[0].shape[inputs[1]]]
 
 
 @register_node_handler("aten::view")
 def aten_view(inputs, attributes, scope):
     assert len(inputs) == 2
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = current_context().network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         shape = inputs[1][1:]
         # trt tensor shape don't include batch axis
         # TODO add batch size check
@@ -26,6 +66,8 @@ def aten_view(inputs, attributes, scope):
         layer.name = scope
         output.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        return [_op.reshape(inputs[0], newshape=inputs[1])]
     return [inputs[0].view(*inputs[1])]
 
 
@@ -34,30 +76,31 @@ def aten_convolution(inputs, attributes, scope):
     inp, weight, bias = inputs[:3]
     stride, pad, dilation = inputs[3:6]
     transposed, output_padding, groups = inputs[6:9]
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if transposed:
+        I, O_groups, *ksize = weight.shape
+        O = O_groups * groups
+    else:
+        O, I_groups, *ksize = weight.shape
+        I = I_groups * groups
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         assert all([e == 0 for e in output_padding
                     ]), "tensor rt don't support out padding"
-        if transposed:
-            I, O_groups, *ksize = weight.shape
-            O = O_groups * groups
-        else:
-            O, I_groups, *ksize = weight.shape
-            I = I_groups * groups
         ndim = len(ksize)
         assert ndim == 2, "tensorrt only support 2d conv"
         # trt weight format: GKCRS: [num_groups, O_groups, I, H, W]
         weight = weight.detach().cpu().numpy()
         if bias is not None:
-            bias = bias.detach().cpu().numpy()
+            trt_bias = bias.detach().cpu().numpy()
         else:
-            bias = trt.Weights()
+            trt_bias = trt.Weights()
         if transposed:
             layer = net.add_deconvolution(inputs[0], O, tuple(ksize), weight,
-                                          bias)
+                                          trt_bias)
         else:
             layer = net.add_convolution(inputs[0], O, tuple(ksize), weight,
-                                        bias)
+                                        trt_bias)
             layer.dilation = tuple(dilation)
         layer.stride = tuple(stride)
         layer.padding = tuple(pad)
@@ -65,7 +108,42 @@ def aten_convolution(inputs, attributes, scope):
         output = layer.get_output(0)
         output.name = scope
         layer.name = scope
+        ctx.refit_weight_dict[layer.name] = {
+            "type": "Convolution",
+            "weight": inputs[1].__torch2trt_weight_name,
+        }
+        if bias is not None:
+            ctx.refit_weight_dict[layer.
+                                  name]["bias"] = bias.__torch2trt_weight_name
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        weight = weight.detach().cpu().numpy()
+        weight_t = _expr.var(
+            scope + "/weight", shape=weight.shape, dtype="float32")
+        ctx.tvm_weight_dict[weight_t] = weight
+        if bias is not None:
+            bias = bias.detach().cpu().numpy()
+            bias_t = _expr.var(
+                scope + "/bias", shape=bias.shape, dtype="float32")
+            ctx.tvm_weight_dict[bias_t] = bias
+        new_attrs = {}
+        new_attrs["channels"] = O
+        new_attrs["kernel_size"] = ksize
+        new_attrs["strides"] = stride
+        new_attrs["padding"] = pad
+        new_attrs["dilation"] = dilation
+        new_attrs["groups"] = groups
+        new_attrs["data_layout"] = "NCHW"
+        new_attrs["kernel_layout"] = "OIHW"
+        use_bias = bias is not None
+        if transposed:
+            new_attrs["output_padding"] = output_padding
+            res = _op.nn.conv2d_transpose(inputs[0], weight_t, **new_attrs)
+        else:
+            res = _op.nn.conv2d(inputs[0], weight_t, **new_attrs)
+        if use_bias:
+            res = _op.nn.bias_add(res, bias_t, axis=1)
+        return [res]
     ndim = len(inputs[3])
     assert ndim == 2
     if transposed:
@@ -81,95 +159,58 @@ def aten_batch_norm(inputs, attributes, scope):
     inp, weight, bias, running_mean, running_var = inputs[:5]
     training, momentum, eps = inputs[5:8]
     # assert training is False
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         running_mean = running_mean.detach().cpu().numpy()
         running_var = running_var.detach().cpu().numpy()
         weight = weight.detach().cpu().numpy()
         bias = bias.detach().cpu().numpy()
         shift = (-running_mean / np.sqrt(running_var + eps)) * weight + bias
         scale = weight / np.sqrt(running_var + eps)
-        layer = net.add_scale(inp, trt.ScaleMode.CHANNEL, shift, scale,
-                              np.ones_like(shift))
+        power = np.ones_like(shift)
+        layer = net.add_scale(inp, trt.ScaleMode.CHANNEL, shift, scale, power)
         output = layer.get_output(0)
         output.name = scope
         layer.name = scope
+        ctx.refit_weight_dict[layer.name] = {
+            "type": "BatchNorm",
+            "running_mean": inputs[3].__torch2trt_weight_name,
+            "running_var": inputs[4].__torch2trt_weight_name,
+            "weight": inputs[1].__torch2trt_weight_name,
+            "bias": inputs[2].__torch2trt_weight_name,
+            "eps": eps,
+        }
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        running_mean = running_mean.detach().cpu().numpy()
+        running_var = running_var.detach().cpu().numpy()
+        weight = weight.detach().cpu().numpy()
+        bias = bias.detach().cpu().numpy()
+        running_mean_t = _expr.var(
+            scope + "/running_mean", shape=running_mean.shape, dtype="float32")
+        running_var_t = _expr.var(
+            scope + "/running_var", shape=running_var.shape, dtype="float32")
+        weight_t = _expr.var(
+            scope + "/weight", shape=weight.shape, dtype="float32")
+        bias_t = _expr.var(scope + "/bias", shape=bias.shape, dtype="float32")
+        ctx.tvm_weight_dict[running_mean_t] = running_mean
+        ctx.tvm_weight_dict[running_var_t] = running_var
+        ctx.tvm_weight_dict[weight_t] = weight
+        ctx.tvm_weight_dict[bias_t] = bias
+        new_attrs = {}
+        new_attrs["axis"] = 1
+        new_attrs["epsilon"] = eps
+        new_attrs["center"] = True
+        new_attrs["scale"] = True
+        new_attrs['gamma'] = weight_t
+        new_attrs['beta'] = bias_t
+        new_attrs['moving_mean'] = running_mean_t
+        new_attrs['moving_var'] = running_var_t
+        result, moving_mean, moving_var = _op.nn.batch_norm(inp, **new_attrs)
+        return [result]
     res = F.batch_norm(inp, running_mean, running_var, weight, bias,
                        bool(training), momentum, eps)
-    return [res]
-
-
-@register_node_handler("aten::max_pool2d")
-def aten_max_pool2d(inputs, attributes, scope):
-    inp = inputs[0]
-    ksize, stride, pad, dilation = inputs[1:5]
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
-        layer = net.add_pooling(inp, trt.PoolingType.MAX, ksize)
-        layer.stride = stride
-        layer.padding = pad
-        assert all(
-            [b == 1 for b in dilation]), "trt pool don't support dilation"
-        output = layer.get_output(0)
-        output.name = scope
-        layer.name = scope
-        return [output]
-
-    res = F.max_pool2d(inp, ksize, stride, pad, dilation)
-    return [res]
-
-
-@register_node_handler("aten::avg_pool2d")
-def aten_avg_pool2d(inputs, attributes, scope):
-    inp = inputs[0]
-    ksize, stride, pad, ceil_mode, count_include_pad = inputs[1:6]
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
-        layer = net.add_pooling(inp, trt.PoolingType.AVERAGE, ksize)
-        layer.stride = stride
-        layer.padding = pad
-        layer.average_count_excludes_padding = not count_include_pad
-        output = layer.get_output(0)
-        output.name = scope
-        layer.name = scope
-        return [output]
-    inp = inputs[0]
-    ksize, stride, pad, ceil_mode = inputs[1:5]
-    res = F.avg_pool2d(inp, ksize, stride, pad, bool(ceil_mode),
-                       bool(count_include_pad))
-    return [res]
-
-
-@register_node_handler("aten::adaptive_avg_pool2d")
-def aten_adaptive_avg_pool2d(inputs, attributes, scope):
-    inp = inputs[0]
-    ksize = inputs[1]
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
-        inp_shape = inp.shape[1:]
-        ksize = [i // k for i, k in zip(inp_shape, ksize)]
-        assert all([i % k == 0 for i, k in zip(inp_shape, ksize)])
-        layer = net.add_pooling(inp, trt.PoolingType.AVERAGE, ksize)
-        # print("WARNING: adaptive_avg_pool2d support is imcomplete")
-        output = layer.get_output(0)
-        output.name = scope
-        layer.name = scope
-        return [output]
-    inp = inputs[0]
-    ksize = inputs[1]
-    res = F.adaptive_avg_pool2d(inp, ksize)
-    return [res]
-
-
-@register_node_handler("aten::dropout")
-def aten_dropout(inputs, attributes, scope):
-    inp = inputs[0]
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
-        return [inputs[0]]
-    rate, training = inputs[1:3]
-    res = F.dropout2d(inp, rate, bool(training))
     return [res]
 
 
@@ -177,8 +218,9 @@ def aten_dropout(inputs, attributes, scope):
 def aten_addmm(inputs, attributes, scope):
     mat_to_add, mat1, mat2 = inputs[:3]
     beta, alpha = inputs[3:5]
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         assert beta == 1 and alpha == 1
         assert len(mat_to_add.shape) == 1
         inp = mat1
@@ -192,17 +234,182 @@ def aten_addmm(inputs, attributes, scope):
         output = layer.get_output(0)
         output.name = scope
         layer.name = scope
+        ctx.refit_weight_dict[layer.name] = {
+            "type": "Linear",
+            "weight": inputs[2].__torch2trt_weight_name,
+            "bias": inputs[0].__torch2trt_weight_name,
+        }
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        inp = mat1
+        weight = mat2.t().detach().cpu().numpy()
+        bias = mat_to_add.detach().cpu().numpy()
+        C = weight.shape[0]
+        weight_t = _expr.var(
+            scope + "/weight", shape=weight.shape, dtype="float32")
+        ctx.tvm_weight_dict[weight_t] = weight
+        if bias is not None:
+            bias_t = _expr.var(
+                scope + "/bias", shape=bias.shape, dtype="float32")
+            ctx.tvm_weight_dict[bias_t] = bias
+        res = _op.nn.dense(inp, weight_t, units=C)
+        res = _op.nn.bias_add(res, bias_t, axis=1)
+        return [res]
 
     res = torch.addmm(beta, mat_to_add, alpha, mat1, mat2)
+    return [res]
+
+
+@register_node_handler("aten::matmul")
+def aten_matmul(inputs, attributes, scope):
+    mat1, mat2 = inputs[:2]
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
+        assert isinstance(mat2, torch.Tensor)
+        inp = mat1
+        weight = mat2.t().detach().cpu().numpy()
+        C = weight.shape[0]
+        # use fc to implement this
+        if len(inp.shape) < 3:
+            inp = _trt_reshape(net, inp, [-1, 1, 1], scope + "/reshape")
+        layer = net.add_fully_connected(inp, C, weight, trt.Weights())
+        output = layer.get_output(0)
+        output.name = scope
+        layer.name = scope
+        ctx.refit_weight_dict[layer.name] = {
+            "type": "Linear",
+            "weight": inputs[1].__torch2trt_weight_name,
+        }
+        return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        inp = mat1
+        weight = mat2.t().detach().cpu().numpy()
+        C = weight.shape[0]
+        weight_t = _expr.var(
+            scope + "/weight", shape=weight.shape, dtype="float32")
+        ctx.tvm_weight_dict[weight_t] = weight
+        res = _op.nn.dense(inputs[0], weight_t, units=C)
+        return [res]
+    res = torch.matmul(mat1, mat2)
+    return [res]
+
+
+@register_node_handler("aten::max_pool2d")
+def aten_max_pool2d(inputs, attributes, scope):
+    inp = inputs[0]
+    ksize, stride, pad, dilation, ceil_mode = inputs[1:6]
+    if len(stride) == 0:
+        stride = ksize
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
+        layer = net.add_pooling(inp, trt.PoolingType.MAX, ksize)
+        layer.stride = stride
+        layer.padding = pad
+        assert all(
+            [b == 1 for b in dilation]), "trt pool don't support dilation"
+        output = layer.get_output(0)
+        output.name = scope
+        layer.name = scope
+        return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        assert all(
+            [b == 1 for b in dilation]), "tvm maxpool don't support dilation"
+        new_attrs = {}
+        new_attrs["pool_size"] = ksize
+        new_attrs["strides"] = stride
+        new_attrs["padding"] = pad
+        new_attrs["ceil_mode"] = ceil_mode
+        return [_op.nn.max_pool2d(inp, **new_attrs)]
+
+    res = F.max_pool2d(inp, ksize, stride, pad, dilation, bool(ceil_mode))
+    return [res]
+
+
+@register_node_handler("aten::avg_pool2d")
+def aten_avg_pool2d(inputs, attributes, scope):
+    inp = inputs[0]
+    ksize, stride, pad, ceil_mode, count_include_pad = inputs[1:6]
+    if len(stride) == 0:
+        stride = ksize
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
+        layer = net.add_pooling(inp, trt.PoolingType.AVERAGE, ksize)
+        layer.stride = stride
+        layer.padding = pad
+        layer.average_count_excludes_padding = not count_include_pad
+        output = layer.get_output(0)
+        output.name = scope
+        layer.name = scope
+        return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        new_attrs = {}
+        new_attrs["pool_size"] = ksize
+        new_attrs["strides"] = stride
+        new_attrs["padding"] = pad
+        new_attrs["ceil_mode"] = ceil_mode
+        new_attrs["count_include_pad"] = count_include_pad
+        return [_op.nn.avg_pool2d(inp, **new_attrs)]
+
+    inp = inputs[0]
+    ksize, stride, pad, ceil_mode = inputs[1:5]
+    res = F.avg_pool2d(inp, ksize, stride, pad, bool(ceil_mode),
+                       bool(count_include_pad))
+    return [res]
+
+
+@register_node_handler("aten::adaptive_avg_pool2d")
+def aten_adaptive_avg_pool2d(inputs, attributes, scope):
+    inp = inputs[0]
+    ksize = inputs[1]
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
+        inp_shape = inp.shape[1:]
+        ksize = [i // k for i, k in zip(inp_shape, ksize)]
+        assert all([i % k == 0 for i, k in zip(inp_shape, ksize)])
+        layer = net.add_pooling(inp, trt.PoolingType.AVERAGE, ksize)
+        # print("WARNING: adaptive_avg_pool2d support is imcomplete")
+        output = layer.get_output(0)
+        output.name = scope
+        layer.name = scope
+        return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        inp_shape = _tvm_shape(inp)
+        inp_shape = inp_shape[2:]
+        ksize = [i // k for i, k in zip(inp_shape, ksize)]
+        assert all([i % k == 0 for i, k in zip(inp_shape, ksize)])
+
+        return [_op.nn.avg_pool2d(inp, ksize)]
+
+    inp = inputs[0]
+    ksize = inputs[1]
+    res = F.adaptive_avg_pool2d(inp, ksize)
+    return [res]
+
+
+@register_node_handler("aten::dropout")
+def aten_dropout(inputs, attributes, scope):
+    inp = inputs[0]
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
+        return [inputs[0]]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        return [inputs[0]]
+    rate, training = inputs[1:3]
+    res = F.dropout2d(inp, rate, bool(training))
     return [res]
 
 
 @register_node_handler("aten::cat")
 def aten_cat(inputs, attributes, scope):
     tensors, dim = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(tensors):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         assert dim > 0
         layer = net.add_concatenation(tensors)
         layer.axis = dim - 1  # trt don't support batch axis
@@ -210,6 +417,9 @@ def aten_cat(inputs, attributes, scope):
         output.name = scope
         layer.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        return [_op.concatenate(tuple(tensors), axis=dim)]
+
     res = torch.cat(tensors, dim=dim)
     return [res]
 
@@ -232,11 +442,31 @@ def _trt_torch_slice(net, inp, dim, start, end, step, name):
     return output
 
 
+def _tvm_torch_slice(inp, dim, start, end, step, name):
+    inp_shape = _tvm_shape(inp)
+    print(inp_shape)
+    ndim = len(inp_shape)
+    starts = [0] * ndim
+    ends = [0] * ndim
+    steps = [0] * ndim
+    for i in range(ndim):
+        starts[i] = 0
+        ends[i] = inp_shape[i]
+        steps[i] = 1
+    starts[dim] = start
+    ends[dim] = min(end, int(inp_shape[dim]))
+    steps[dim] = step
+    new_attrs = {'begin': starts, 'end': ends, "strides": steps}
+    print(starts, steps, ends)
+    return _op.strided_slice(inp, **new_attrs)
+
+
 @register_node_handler("aten::slice")
 def aten_slice(inputs, attributes, scope):
     inp, dim, start, end, step = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         if dim == 0:
             if start == 0 and step == 1 and end > 100000000:
                 return [inp]
@@ -246,6 +476,8 @@ def aten_slice(inputs, attributes, scope):
         output = _trt_torch_slice(net, inp, dim, start, end, step, scope)
         output.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        return [_tvm_torch_slice(inp, dim, start, end, step, scope)]
     slice_ = slice(start, end, step)
     slices = [slice(None, None, None) for _ in range(dim + 1)]
     slices[dim] = slice_
@@ -285,26 +517,50 @@ def _trt_reshape(net, inp, shape, name):
     return output
 
 
+def _tvm_squeeze(inp, dim, name):
+    return _op.squeeze(inp, axis=[dim])
+
+
+def _tvm_unsqueeze(inp, dim, name):
+    inp_shape = _tvm_shape(inp)
+    inp_shape = list(inp_shape)
+    inp_shape.insert(dim, 1)
+    return _op.reshape(inp, newshape=inp_shape)
+
+
+def _tvm_reshape(inp, shape, name):
+    return _op.reshape(inp, newshape=shape)
+
+
 @register_node_handler("aten::unsqueeze")
 def aten_unsqueeze(inputs, attributes, scope):
     inp, dim = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         return [_trt_unsqueeze(net, inp, dim, scope)]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        return [_tvm_unsqueeze(inp, dim, scope)]
     return [inp.unsqueeze(dim)]
 
 
 @register_node_handler("aten::select")
 def aten_select(inputs, attributes, scope):
     inp, dim, index = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         assert dim > 0
         output = _trt_torch_slice(net, inp, dim, index, index + 1, 1,
                                   scope + "/slice")
         output.name = scope + "/slice"
         output = _trt_squeeze(net, output, dim, scope + "/squeeze")
         output.name = scope + "/squeeze"
+        return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        output = _tvm_torch_slice(inp, dim, index, index + 1, 1,
+                                  scope + "/slice")
+        output = _tvm_squeeze(output, dim, scope + "/squeeze")
         return [output]
     slice_ = slice(index, index + 1, 1)
     slices = [slice(None, None, None) for _ in range(dim + 1)]
@@ -382,15 +638,61 @@ def try_convert_to_constant(net, inputs):
     return res
 
 
+def torchdtype_to_tvm_map():
+    return {
+        torch.float32: "float32",
+        torch.float64: "float64",
+        torch.float16: "float16",
+        torch.int32: "int32",
+        torch.int64: "int64",
+        torch.uint8: "uint8",
+    }
+
+
+def torchdtype_to_tvm_map_inv():
+    dict_ = torchdtype_to_tvm_map()
+    return {v: k for k, v in dict_.items()}
+
+
+def torchdtype_to_tvm(ttype):
+    return torchdtype_to_tvm_map()[ttype]
+
+
+def tvm_to_torchdtype(dtype):
+    return torchdtype_to_tvm_map_inv()[dtype]
+
+
+def _tvm_to_const(args):
+    ref_type = None
+    for arg in args:
+        if isinstance(arg, _expr.Expr):
+            ref_type = _tvm_dtype(arg)
+    ttype = tvm_to_torchdtype(ref_type)
+    res = []
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            dtype = torchdtype_to_tvm(arg.dtype)
+            arg = _expr.const(
+                arg.to(ttype).detach().cpu().float().numpy(), dtype=dtype)
+        elif not isinstance(arg, _expr.Expr):
+            arg = _expr.const(arg, dtype=dtype)
+        res.append(arg)
+    return res
+
+
 @register_node_handler("aten::mul")
 def aten_mul(inputs, attributes, scope):
     # print_inputs(inputs)
     lfs, rfs = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         output = _scale_or_elementwise(net, lfs, rfs, "mul", scope)
         output.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        lfs, rfs = _tvm_to_const([lfs, rfs])
+        return [_op.multiply(lfs, rfs)]
     return [lfs * rfs]
 
 
@@ -398,11 +700,16 @@ def aten_mul(inputs, attributes, scope):
 def aten_mul_(inputs, attributes, scope):
     # print_inputs(inputs)
     lfs, rfs = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         output = _scale_or_elementwise(net, lfs, rfs, "mul", scope)
         output.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        lfs, rfs = _tvm_to_const([lfs, rfs])
+        return [_op.multiply(lfs, rfs)]
+
     lfs *= rfs
     return [lfs]
 
@@ -410,12 +717,17 @@ def aten_mul_(inputs, attributes, scope):
 @register_node_handler("aten::add_")
 def aten_add_(inputs, attributes, scope):
     lfs, rfs, alpha = inputs
-    net = current_network()
     assert alpha == 1
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         output = _scale_or_elementwise(net, lfs, rfs, "add", scope)
         output.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        lfs, rfs = _tvm_to_const([lfs, rfs])
+        return [_op.add(lfs, rfs)]
+
     lfs.add_(rfs)
     return [lfs]
 
@@ -424,11 +736,15 @@ def aten_add_(inputs, attributes, scope):
 def aten_add(inputs, attributes, scope):
     lfs, rfs, alpha = inputs
     assert alpha == 1
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         output = _scale_or_elementwise(net, lfs, rfs, "add", scope)
         output.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        lfs, rfs = _tvm_to_const([lfs, rfs])
+        return [_op.add(lfs, rfs)]
     return [lfs + rfs]
 
 
@@ -436,11 +752,15 @@ def aten_add(inputs, attributes, scope):
 def aten_div(inputs, attributes, scope):
     # print_inputs(inputs)
     lfs, rfs = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         output = _scale_or_elementwise(net, lfs, rfs, "div", scope)
         output.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        lfs, rfs = _tvm_to_const([lfs, rfs])
+        return [_op.divide(lfs, rfs)]
     return [lfs / rfs]
 
 
@@ -449,11 +769,16 @@ def aten_sub(inputs, attributes, scope):
     # print_inputs(inputs)
     lfs, rfs, alpha = inputs
     assert alpha == 1
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         output = _scale_or_elementwise(net, lfs, rfs, "sub", scope)
         output.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        lfs, rfs = _tvm_to_const([lfs, rfs])
+        return [_op.subtract(lfs, rfs)]
+
     return [lfs - rfs]
 
 
@@ -471,8 +796,9 @@ def _axes_to_trt_axis(axes, ndim):
 @register_node_handler("aten::sum")
 def aten_sum(inputs, attributes, scope):
     inp, dim, keepdim = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         if not isinstance(dim, list):
             dim = [dim]
         axis_trt = _axes_to_trt_axis(dim, len(inp.shape))
@@ -482,14 +808,18 @@ def aten_sum(inputs, attributes, scope):
         output.name = scope
         layer.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        return [_op.reduce.sum(inp, dim, keepdims=bool(keepdim))]
+
     return [inp.sum(dim, keepdim=bool(keepdim))]
 
 
 @register_node_handler("aten::max")
 def aten_max(inputs, attributes, scope):
     inp, dim, keepdim = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         if not isinstance(dim, list):
             dim = [dim]
         axis_trt = _axes_to_trt_axis(dim, len(inp.shape))
@@ -499,14 +829,18 @@ def aten_max(inputs, attributes, scope):
         layer.name = scope
         output.name = scope
         return [output, None]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        return [_op.reduce.max(inp, dim, keepdims=bool(keepdim)), None]
+
     return [*inp.max(dim, keepdim=bool(keepdim))]
 
 
 @register_node_handler("aten::min")
 def aten_min(inputs, attributes, scope):
     inp, dim, keepdim = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         if not isinstance(dim, list):
             dim = [dim]
         axis_trt = _axes_to_trt_axis(dim, len(inp.shape))
@@ -516,14 +850,18 @@ def aten_min(inputs, attributes, scope):
         layer.name = scope
         output.name = scope
         return [output, None]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        return [_op.reduce.min(inp, dim, keepdims=bool(keepdim)), None]
+
     return [*inp.min(dim, keepdim=bool(keepdim))]
 
 
 @register_node_handler("aten::mean")
 def aten_mean(inputs, attributes, scope):
     inp, dim, keepdim = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         if not isinstance(dim, list):
             dim = [dim]
         axis_trt = _axes_to_trt_axis(dim, len(inp.shape))
@@ -533,14 +871,18 @@ def aten_mean(inputs, attributes, scope):
         layer.name = scope
         output.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        return [_op.reduce.mean(inp, dim, keepdims=bool(keepdim))]
+
     return [inp.mean(dim, keepdim=bool(keepdim))]
 
 
 @register_node_handler("aten::prod")
 def aten_prod(inputs, attributes, scope):
     inp, dim, keepdim = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         axis_trt = _axes_to_trt_axis([dim], len(inp.shape))
         layer = net.add_reduce(inp, trt.ReduceOperation.PROD, axis_trt,
                                bool(keepdim))
@@ -548,14 +890,18 @@ def aten_prod(inputs, attributes, scope):
         layer.name = scope
         output.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        return [_op.reduce.prod(inp, dim, keepdims=bool(keepdim))]
+
     return [inp.prod(dim, keepdim=bool(keepdim))]
 
 
 @register_node_handler("aten::permute")
 def aten_permute(inputs, attributes, scope):
     inp, params = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         perm_params = params[1:]
         assert all([p > 0 for p in perm_params])
         layer = net.add_shuffle(inp)
@@ -564,14 +910,17 @@ def aten_permute(inputs, attributes, scope):
         output.name = scope
         layer.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        return [_op.transform.transpose(inp, params)]
     return [inputs[0].permute(*params)]
 
 
 @register_node_handler("aten::transpose")
 def aten_transpose(inputs, attributes, scope):
     inp, dim0, dim1 = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         assert all([p > 0 for p in [dim0, dim1]])
         params = list(range(len(inp.shape)))
         tmp = params[dim1 - 1]
@@ -583,14 +932,23 @@ def aten_transpose(inputs, attributes, scope):
         output.name = scope
         layer.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        inp_shape = _tvm_shape(inp)
+        params = list(range(len(inp_shape)))
+        tmp = params[dim1]
+        params[dim1] = params[dim0]
+        params[dim0] = tmp
+        return [_op.transform.transpose(inp, params)]
+
     return [torch.transpose(inputs[0], dim0, dim1)]
 
 
 @register_node_handler("aten::chunk")
 def aten_chunk(inputs, attributes, scope):
     inp, chunk, dim = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         assert dim > 0
         # use slice to implement chunk
         outputs = []
@@ -600,13 +958,25 @@ def aten_chunk(inputs, attributes, scope):
                                    scope + "/slice_{}".format(i))
             outputs.append(out)
         return [outputs]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        outputs = []
+        step = inp.shape[dim] // chunk
+        for i in range(chunk):
+            out = _tvm_torch_slice(inp, dim, i * step, (i + 1) * step, 1,
+                                   scope + "/slice_{}".format(i))
+            outputs.append(out)
+        return [outputs]
+
     return [torch.chunk(inputs[0], chunk, dim)]
 
 
 @register_node_handler("aten::contiguous")
 def aten_contiguous(inputs, attributes, scope):
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
+        return [inputs[0]]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
         return [inputs[0]]
     return [inputs[0].contiguous()]
 
@@ -614,8 +984,9 @@ def aten_contiguous(inputs, attributes, scope):
 @register_node_handler("aten::constant_pad_nd")
 def aten_constant_pad_nd(inputs, attributes, scope):
     inp, pad_params, val = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         assert val == 0.0
         w0, h0, w1, h1 = pad_params
         layer = net.add_padding(inp, (w0, h0), (w1, h1))
@@ -623,14 +994,20 @@ def aten_constant_pad_nd(inputs, attributes, scope):
         output.name = scope
         layer.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        w0, h0, w1, h1 = pad_params
+        pad_width = [(0, 0), (0, 0), (w0, h0), (w1, h1)]
+        return [_op.nn.pad(inp, pad_width, val)]
+
     return [F.pad(inp, pad_params, value=val)]
 
 
 @register_node_handler("aten::softmax")
 def aten_softmax(inputs, attributes, scope):
     inp, axis = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         axes_trt = _axes_to_trt_axis([axis], len(inp.shape))
         layer = net.add_softmax(inp)
         layer.axes = axes_trt
@@ -638,27 +1015,33 @@ def aten_softmax(inputs, attributes, scope):
         output.name = scope
         layer.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        return [_op.nn.softmax(inputs[0], axis=axis)]
     return [F.softmax(inp, axis)]
 
 
 @register_node_handler("aten::index_select")
 def aten_index_select(inputs, attributes, scope):
     inp, axis, index = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         layer = net.add_gather(inp, index, axis - 1)
         output = layer.get_output(0)
         output.name = scope
         layer.name = scope
         return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        raise NotImplementedError
     return [torch.index_select(inp, axis, index)]
 
 
 @register_node_handler("aten::repeat")
 def aten_repeat(inputs, attributes, scope):
     inp, params = inputs
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
         assert params[0] == 1
         assert len(params) > 1
         assert len(params) == len(inp.shape) + 1
@@ -678,4 +1061,7 @@ def aten_repeat(inputs, attributes, scope):
                 out.name = scope + "/" + "gather_{}".format(i)
             i += 1
         return [out]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        raise NotImplementedError
+
     return [inp.repeat(*params)]

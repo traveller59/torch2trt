@@ -1,7 +1,7 @@
 import tensorrt as trt
 import torch
 
-from torch2trt.core import (current_network, has_trt_tensor,
+from torch2trt.core import (current_context, has_trt_tensor,
                             register_node_handler)
 from torch2trt.utils import print_inputs
 
@@ -22,20 +22,6 @@ def prim_list_construct(inputs, attributes, scope):
 def prim_tuple_construct(inputs, attributes, scope):
     return [tuple(inputs)]
 
-
-@register_node_handler("aten::size")
-def aten_size(inputs, attributes, scope):
-    axis = inputs[1]
-    net = current_network()
-    if net is not None and has_trt_tensor(inputs):
-        # trt tensor shape don't include batch axis
-        if axis == 0:
-            return [-1] # can't be None because prim::Int may take this result.
-        else:
-            return [inputs[0].shape[inputs[1] - 1]]
-    return [inputs[0].shape[inputs[1]]]
-
-
 @register_node_handler("prim::NumToTensor")
 def prim_num_to_tensor(inputs, attributes, scope):
     return [inputs[0]]
@@ -49,16 +35,19 @@ def prim_int(inputs, attributes, scope):
 @register_node_handler("aten::to")
 def aten_to(inputs, attributes, scope):
     inp, dst = inputs[:2]
-    net = current_network()
+    net = current_context().network
     if net is not None and has_trt_tensor(inputs):
         raise NotImplementedError
-    return [inp.to(dst)]
+    res = inp.to(dst)
+    if hasattr(inp, "__torch2trt_weight_name"):
+        res.__torch2trt_weight_name = inp.__torch2trt_weight_name
+    return [res]
 
 
 @register_node_handler("aten::detach")
 def aten_detach(inputs, attributes, scope):
     inp = inputs[0]
-    net = current_network()
+    net = current_context().network
     if net is not None and has_trt_tensor(inputs):
         raise NotImplementedError
     return [inp.detach()]
@@ -69,7 +58,10 @@ def aten_t(inputs, attributes, scope):
     inp = inputs[0]
     # weights in nn.Linear use this.
     assert isinstance(inp, torch.Tensor), "don't support this in tensorrt"
-    return [inputs[0].t()]
+    res = inputs[0].t()
+    if hasattr(inp, "__torch2trt_weight_name"):
+        res.__torch2trt_weight_name = inp.__torch2trt_weight_name
+    return [res]
 
 
 @register_node_handler("prim::ListUnpack")

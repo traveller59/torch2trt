@@ -17,6 +17,19 @@ from torch.onnx.utils import \
 
 from torch2trt.utils import print_inputs, pretty_str
 
+TVM_ENABLE = True 
+try:
+    import tvm 
+    from tvm.relay import expr as _expr
+    from tvm.relay import op as _op
+    from tvm import nd as _nd
+
+except ImportError:
+    TVM_ENABLE = False
+
+def tvm_enable():
+    return TVM_ENABLE
+
 methods_OP = [
     'attributeNames', 'hasMultipleOutputs', 'hasUses', 'inputs', 'kind',
     'outputs', 'outputsSize', 'scopeName'
@@ -31,30 +44,54 @@ methods_IO = ['node', 'offset', 'uniqueName']
 
 REGISTERED_NODE_HANDLERS = {}
 
-CURRENT_NETWORK = None  # when None, will use pytorch debug mode.
+class GlobalContext:
+    def __init__(self, network: trt.INetworkDefinition):
+        self.network = network
+        self.refit_weight_dict = {} # contains weight name map for trt engine refit
+        self.tvm_weight_dict = OrderedDict() # contains tvm var to tvm ndarray
 
+    @property
+    def is_tensorrt(self):
+        return isinstance(self.network, trt.INetworkDefinition)
+
+    @property
+    def is_torch(self):
+        return self.network is None 
+
+    @property
+    def is_tvm(self):
+        return self.network == "tvm"
+
+CURRENT_CONTEXT = GlobalContext(None)  # when None, will use pytorch debug mode.
 
 @contextlib.contextmanager
 def trt_network(net):
-    global CURRENT_NETWORK
-    backup = CURRENT_NETWORK
-    CURRENT_NETWORK = net
-    yield net
-    CURRENT_NETWORK = backup
+    global CURRENT_CONTEXT
+    backup = CURRENT_CONTEXT
+    CURRENT_CONTEXT = GlobalContext(net)
+    yield None
+    CURRENT_CONTEXT = backup
 
 
 @contextlib.contextmanager
 def torch_network():
-    global CURRENT_NETWORK
-    backup = CURRENT_NETWORK
-    CURRENT_NETWORK = None
+    global CURRENT_CONTEXT
+    backup = CURRENT_CONTEXT
+    CURRENT_CONTEXT = GlobalContext(None)
     yield None
-    CURRENT_NETWORK = backup
+    CURRENT_CONTEXT = backup
 
+@contextlib.contextmanager
+def tvm_network():
+    global CURRENT_CONTEXT
+    backup = CURRENT_CONTEXT
+    CURRENT_CONTEXT = GlobalContext("tvm")
+    yield None
+    CURRENT_CONTEXT = backup
 
-def current_network() -> trt.INetworkDefinition:
-    global CURRENT_NETWORK
-    return CURRENT_NETWORK
+def current_context() -> GlobalContext:
+    global CURRENT_CONTEXT
+    return CURRENT_CONTEXT
 
 
 def register_node_handler(name):
@@ -62,7 +99,9 @@ def register_node_handler(name):
         global REGISTERED_NODE_HANDLERS
         # assert name not in REGISTERED_NODE_HANDLERS, f"exist handlers: {REGISTERED_NODE_HANDLERS.keys()}"
         REGISTERED_NODE_HANDLERS[name] = handler
-        return handler
+        def new_handler(inputs, attributes, scope):
+            return handler(inputs, attributes, scope)
+        return new_handler
 
     return wrap_func
 
@@ -93,6 +132,18 @@ def has_torch_tensor(inputs):
             for elem in inp:
                 res |= has_torch_tensor([elem])
         elif isinstance(inp, torch.Tensor):
+            return True
+    return res
+
+def has_tvm_tensor(inputs):
+    if not tvm_enable():
+        return False
+    res = False
+    for inp in inputs:
+        if isinstance(inp, (list, tuple)):
+            for elem in inp:
+                res |= has_tvm_tensor([elem])
+        elif isinstance(inp, _expr.Expr):
             return True
     return res
 
@@ -184,6 +235,7 @@ class NodePyIO(NodePy):
             self.kind = 'IO Node'
         self.resolved_outputs = [None]
         self.resolved = True
+        self._weight_name = None
 
 
 class NodePyOP(NodePy):
@@ -224,6 +276,8 @@ class GraphPy(object):
         self.scope_name_appeared = []
         self.output_nodes = []
         self.readable_name_to_node = {}
+        self.refit_weight_dict = {}
+        self.context = None
 
     def get_output_nodes_dict(self):
         nodes_dict = OrderedDict()
@@ -414,7 +468,6 @@ def parse(graph, num_inputs, omit_useless_nodes=False):
     for output_name in output_names:
         out_to_node = graph_py.get_out_to_node()
         out_node = out_to_node[output_name]
-
         def recursive_assign_name(node: NodePy):
             if isinstance(node, NodePyOP):
                 if node.readable_unique_name is None:
@@ -431,11 +484,16 @@ def parse(graph, num_inputs, omit_useless_nodes=False):
                 return
             for inp_name in node.inputs:
                 recursive_assign_name(out_to_node[inp_name])
-
         recursive_assign_name(out_node)
-
     return graph_py
 
+class UniqueNamePool:
+    def __init__(self, max_count=10000):
+        self.max_count = max_count
+        self.unique_set = set()
+
+    def __call__(self, name):
+        return _make_unique_name(self.unique_set, name)
 
 def _get_jit_params(module, param_exclude, param_include):
     state_dict = _unique_state_dict(module)
@@ -454,10 +512,11 @@ def _get_jit_params(module, param_exclude, param_include):
             if "weight" in k or "bias" in k or "running_mean" in k or "running_var" in k:
                 new_state_dict[k] = v
     params = list(new_state_dict.values())[::-1]
-    return params
+    return params, list(new_state_dict.keys())[::-1]
 
 
 def resolve_graph(graph_py: GraphPy, output_names, verbose=False):
+    ctx = current_context()
     out_to_node = graph_py.get_out_to_node()
     out_to_idx = graph_py.get_out_to_idx()
     if not isinstance(output_names, (list, tuple)):
@@ -472,24 +531,27 @@ def resolve_graph(graph_py: GraphPy, output_names, verbose=False):
                 stack.pop()
                 continue
             inputs = []
+            input_nodes = []
             prepared = True
             for inp_name in node.inputs:
                 inp_node = out_to_node[inp_name]
                 if not inp_node.resolved:  # node isn't evaluated
                     stack.append(inp_node)
                     prepared = False
+                input_nodes.append(inp_node)
                 inputs.append(inp_node.resolved_outputs[out_to_idx[inp_name]])
             if not prepared:
                 continue
             assert node.readable_unique_name is not None
             if verbose:
                 msg = ""
-                if (has_trt_tensor(inputs) or has_torch_tensor(inputs)):
+                if (has_trt_tensor(inputs) or has_torch_tensor(inputs) or has_tvm_tensor(inputs)):
                     msg += "{}==>>".format(pretty_str(inputs))
             try:
                 handler = get_node_handler(node.kind)
                 results = handler(inputs, node.attributes,
                                   node.readable_unique_name)
+                # results = handler(inputs, node.attributes, pool("net"))
             except Exception as e:
                 print(node.readable_unique_name)
                 if verbose:
@@ -498,8 +560,8 @@ def resolve_graph(graph_py: GraphPy, output_names, verbose=False):
             assert isinstance(results, (list, tuple)), f"{node.kind}"
             assert len(results) == len(node.resolved_outputs), f"{node.kind}"
             if verbose:
-                if ((has_trt_tensor(inputs) or has_torch_tensor(inputs)) and
-                    (has_trt_tensor(results) or has_torch_tensor(results))):
+                if ((has_trt_tensor(inputs) or has_torch_tensor(inputs) or has_tvm_tensor(inputs)) and
+                    (has_trt_tensor(results) or has_torch_tensor(results) or has_tvm_tensor(results))):
                     msg += pretty_str(results)
                     print(node.readable_unique_name)
                     print(msg)
@@ -507,10 +569,10 @@ def resolve_graph(graph_py: GraphPy, output_names, verbose=False):
             node.resolved = True
             stack.pop()
         results.append(out_node.resolved_outputs)
+    graph_py.refit_weight_dict = ctx.refit_weight_dict
     return results
 
-
-def torch2trt(module,
+def _torch_depoly(module,
               example_inputs,
               param_exclude=None,
               param_include=None,
@@ -518,7 +580,7 @@ def torch2trt(module,
               input_tensors=None,
               input_names=None,
               verbose=False):
-    """main entry point of torch2trt.
+    """main entry point of torch2tvm.
 
     Args:
         module: pytorch nn.Module or function.
@@ -538,6 +600,7 @@ def torch2trt(module,
         trace: traced jit module or function. MUST returned to avoid some C++ error.
         graph_pth: GraphPy object. use this to access pytorch graph and get
             resolved output tensors.
+        tvm_module: 
     """
     trace = torch.jit.trace(module, example_inputs, True)
     if not isinstance(example_inputs, (list, tuple)):
@@ -549,16 +612,18 @@ def torch2trt(module,
     if output_names is None:
         output_names = graph_py.get_output_names()
     if isinstance(module, torch.nn.Module):
-        params = _get_jit_params(module, param_exclude, param_include)
+        params, weight_names = _get_jit_params(module, param_exclude, param_include)
         num_param_inputs = len(graph_py.get_param_nodes())
         msg = "expected {} params, but get {} params. ".format(
             num_param_inputs, len(params))
         msg += "This may due to your network have multi output. use param_exclude to remove them"
         assert len(params) == num_param_inputs, msg
-        for pnode, param in zip(graph_py.get_param_nodes(), params):
+        for pnode, param, name in zip(graph_py.get_param_nodes(), params, weight_names):
             pnode.resolved_outputs[0] = param
-    net = current_network()
-    if net is not None:
+            pnode.__torch2trt_weight_name = name
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt:
         assert input_names is not None, "trt mode must provide input name"
         if not isinstance(input_names, (list, tuple)):
             input_names = [input_names]
@@ -578,14 +643,34 @@ def torch2trt(module,
                 inputs.append(tensor)
         for i, inode in enumerate(graph_py.get_input_nodes_dict().values()):
             inode.resolved_outputs[0] = inputs[i]
+    elif ctx.is_tvm:
+        assert input_names is not None, "tvm mode must provide input name"
+        if not isinstance(input_names, (list, tuple)):
+            input_names = [input_names]
+        assert len(input_names) == len(example_inputs)
+        inputs = []
+        if input_tensors is not None:
+            if not isinstance(input_tensors, (list, tuple)):
+                input_tensors = [input_tensors]
+            assert len(input_tensors) == len(example_inputs)
+            inputs = input_tensors
+        else:
+            for torch_inp, name in zip(example_inputs, input_names):
+                tensor = _expr.var(name, shape=torch_inp.shape, dtype="float32")
+                inputs.append(tensor)
+        for i, inode in enumerate(graph_py.get_input_nodes_dict().values()):
+            inode.resolved_outputs[0] = inputs[i]
     else:
         # use torch inputs, debug mode
         for i, inode in enumerate(graph_py.get_input_nodes_dict().values()):
             inode.resolved_outputs[0] = example_inputs[i]
     resolve_graph(graph_py, output_names, verbose=verbose)
+    graph_py.context = ctx
     # trace must be returned to avoid std::bad_alloc
     return trace, graph_py
 
+torch2tvm = _torch_depoly
+torch2trt = _torch_depoly
 
 def clean_resolved_outputs(graph_py, output_name):
     out_to_node = graph_py.get_out_to_node()
@@ -637,14 +722,15 @@ class GraphModule:
         msg = "input mismatch. this may due to some input isn't used in graph"
         assert len(example_inputs) == len(graph_py.get_input_nodes_dict()), msg
         if isinstance(module, torch.nn.Module):
-            params = _get_jit_params(module, param_exclude, param_include)
+            params, weight_names = _get_jit_params(module, param_exclude, param_include)
             num_param_inputs = len(graph_py.get_param_nodes())
             msg = "expected {} params, but get {} params. ".format(
                 num_param_inputs, len(params))
             msg += "This may due to your network have multi output. use param_exclude to remove them"
             assert len(params) == num_param_inputs, msg
-            for pnode, param in zip(graph_py.get_param_nodes(), params):
+            for pnode, param, name in zip(graph_py.get_param_nodes(), params, weight_names):
                 pnode.resolved_outputs[0] = param
+                setattr(param, "__torch2trt_weight_name", name)
 
     def __call__(self, *args, verbose=False, **kw):
         assert len(kw) == 0, "don't support kw arg"
@@ -658,9 +744,10 @@ class GraphModule:
         if has_trt_tensor(args):
             # trt mode
             assert all([isinstance(e, trt.ITensor) for e in args])
-            assert isinstance(current_network(), trt.INetworkDefinition)
+            assert isinstance(current_context().network, trt.INetworkDefinition)
         else:
             assert all([isinstance(e, torch.Tensor) for e in args])
-            assert current_network() is None, "you should run pytorch mode outside trt_network block"
+            assert current_context().network is None, "you should run pytorch mode outside trt_network block"
         resolve_graph(self.graph, output_names, verbose)
         return self.graph.get_resolved_outputs()
+

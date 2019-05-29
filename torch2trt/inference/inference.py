@@ -136,9 +136,12 @@ class InferenceContext:
 class TorchInferenceContext(InferenceContext):
     """same as InferenceContext except this class always take and return torch cuda tensor.
     """
-    def __init__(self, context: trt.IExecutionContext, stream=None):
+    def __init__(self, context: trt.IExecutionContext, stream=None, device=None):
         self.engine = context.engine
-        self.device = torch.device("cuda:0")
+        if device is None:
+            self.device = torch.device("cuda:0")
+        else:
+            self.device = device
         inputs, outputs, bindings = allocate_buffers_torch(self.engine, self.device)
         self.context = context
         self.inputs = inputs
@@ -161,7 +164,7 @@ class TorchInferenceContext(InferenceContext):
             bindings=self.bindings,
             stream_handle=self.stream.handle)
         # must sync here because we use custom stream instead of torch stream
-        self.stream.synchronize() 
+        self.stream.synchronize()
         return {n: v.device[:batch_size] for n, v in self.output_dict.items()}
 
     def execute(self, batch_size):
