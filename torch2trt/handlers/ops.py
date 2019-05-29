@@ -444,7 +444,6 @@ def _trt_torch_slice(net, inp, dim, start, end, step, name):
 
 def _tvm_torch_slice(inp, dim, start, end, step, name):
     inp_shape = _tvm_shape(inp)
-    print(inp_shape)
     ndim = len(inp_shape)
     starts = [0] * ndim
     ends = [0] * ndim
@@ -457,7 +456,6 @@ def _tvm_torch_slice(inp, dim, start, end, step, name):
     ends[dim] = min(end, int(inp_shape[dim]))
     steps[dim] = step
     new_attrs = {'begin': starts, 'end': ends, "strides": steps}
-    print(starts, steps, ends)
     return _op.strided_slice(inp, **new_attrs)
 
 

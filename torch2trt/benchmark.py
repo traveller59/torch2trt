@@ -86,7 +86,7 @@ def benchmark_tvm(net, input_shape=(1, 3, 224, 224)):
     tvm_weight_dict = graph_pth.context.tvm_weight_dict
     params = {k.name_hint: v for k, v in tvm_weight_dict.items()}
     func = expr.Function(ir_pass.free_vars(outputs), outputs)
-    target = 'cuda'
+    target = 'cuda -libs=cudnn'
     with relay.build_config(opt_level=3):
         graph, lib, params = relay.build(func, target, params=params)
     ctx = TVMInferenceContext(graph, lib, params, tvm.gpu(0), ["image"])
@@ -103,8 +103,8 @@ def benchmark_tvm(net, input_shape=(1, 3, 224, 224)):
 
 
 # net = torchvision.models.resnet50(pretrained=True).eval()
-# net = torchvision.models.vgg11_bn(pretrained=True).eval()
+# net = torchvision.models.vgg19_bn(pretrained=True).eval()
 net = torchvision.models.inception_v3(pretrained=True).eval()
 # net = torchvision.models.squeezenet1_1(pretrained=True).eval()
-# benchmark_trt_torch(net, [1, 3, 299, 299])
+# benchmark_trt_torch(net, [1, 3, 224, 224])
 benchmark_tvm(net, [1, 3, 299, 299])

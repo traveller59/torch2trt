@@ -147,6 +147,8 @@ def has_tvm_tensor(inputs):
             return True
     return res
 
+def have_tensor(inputs):
+    return has_tvm_tensor(inputs) or has_trt_tensor(inputs) or has_torch_tensor(inputs)
 
 class NodeBase(object):
     def __init__(self,
@@ -545,13 +547,12 @@ def resolve_graph(graph_py: GraphPy, output_names, verbose=False):
             assert node.readable_unique_name is not None
             if verbose:
                 msg = ""
-                if (has_trt_tensor(inputs) or has_torch_tensor(inputs) or has_tvm_tensor(inputs)):
+                if have_tensor(inputs):
                     msg += "{}==>>".format(pretty_str(inputs))
             try:
                 handler = get_node_handler(node.kind)
                 results = handler(inputs, node.attributes,
                                   node.readable_unique_name)
-                # results = handler(inputs, node.attributes, pool("net"))
             except Exception as e:
                 print(node.readable_unique_name)
                 if verbose:
@@ -560,8 +561,7 @@ def resolve_graph(graph_py: GraphPy, output_names, verbose=False):
             assert isinstance(results, (list, tuple)), f"{node.kind}"
             assert len(results) == len(node.resolved_outputs), f"{node.kind}"
             if verbose:
-                if ((has_trt_tensor(inputs) or has_torch_tensor(inputs) or has_tvm_tensor(inputs)) and
-                    (has_trt_tensor(results) or has_torch_tensor(results) or has_tvm_tensor(results))):
+                if have_tensor(inputs) and have_tensor(results):
                     msg += pretty_str(results)
                     print(node.readable_unique_name)
                     print(msg)
@@ -692,7 +692,7 @@ def clean_resolved_outputs(graph_py, output_name):
 
 
 class GraphModule:
-    """main entry class of torch2trt.
+    """main entry class of torch2trt/torch2tvm.
     Args:
         module: pytorch nn.Module or function.
         example_inputs: list or tuple of example tensors. MUST match arguments of 
@@ -744,10 +744,13 @@ class GraphModule:
         if has_trt_tensor(args):
             # trt mode
             assert all([isinstance(e, trt.ITensor) for e in args])
-            assert isinstance(current_context().network, trt.INetworkDefinition)
+            assert current_context().is_tensorrt
+        elif has_tvm_tensor(args):
+            assert all([isinstance(e, _expr.Expr) for e in args])
+            assert current_context().is_tvm
         else:
             assert all([isinstance(e, torch.Tensor) for e in args])
-            assert current_context().network is None, "you should run pytorch mode outside trt_network block"
+            assert current_context().is_torch, "you should run pytorch mode outside trt_network block"
         resolve_graph(self.graph, output_names, verbose)
         return self.graph.get_resolved_outputs()
 

@@ -25,11 +25,9 @@ Measured in ms, code for benchmark: [benchmark.py](torch2trt/benchmark.py).
 
 | Network        | TensorRT     | TVM   | PyTorch |
 | -------------  |-------------:| -----:| -------:|
-| ResNet50       | 4.86         |  8.85 |    7.54 |
-| InceptionV3    |  8.00        |  14.86| 13.97   |
-| SqueezeNet1.1  |  0.85        |  7.45 | 2.24    |
-
-TVM looks bad because pytorch don't use any autotune.
+| ResNet50       | 4.86         |  6.74 |    7.54 |
+| InceptionV3    |  8.00        |  10.76| 13.97   |
+| SqueezeNet1.1  |  0.85        |  1.44 | 2.24    |
 
 ## Usage
 
@@ -166,23 +164,23 @@ from tvm.contrib import graph_runtime
 import tvm
 from tvm.relay import expr, ir_pass
 from tvm import relay
-    param_exclude = ".*AuxLogits.*"  # for inception v3
-    inputs = torch.rand(*input_shape).float()
-    with torch2trt.core.tvm_network():
-        trace, graph_pth = torch2trt.core.torch2tvm(
-            net,
-            inputs,
-            input_names=["image"],
-            verbose=True,
-            param_exclude=param_exclude)
+param_exclude = ".*AuxLogits.*"  # for inception v3
+inputs = torch.rand(*input_shape).float()
+with torch2trt.core.tvm_network():
+    trace, graph_pth = torch2trt.core.torch2tvm(
+        net,
+        inputs,
+        input_names=["image"],
+        verbose=True,
+        param_exclude=param_exclude)
 
-    outputs = graph_pth.get_resolved_outputs()
-    tvm_weight_dict = graph_pth.context.tvm_weight_dict
-    params = {k.name_hint: v for k, v in tvm_weight_dict.items()}
-    func = expr.Function(ir_pass.free_vars(outputs), outputs)
-    target = 'cuda'
-    with relay.build_config(opt_level=3):
-        graph, lib, params = relay.build(func, target, params=params)
+outputs = graph_pth.get_resolved_outputs()
+tvm_weight_dict = graph_pth.context.tvm_weight_dict
+params = {k.name_hint: v for k, v in tvm_weight_dict.items()}
+func = expr.Function(ir_pass.free_vars(outputs), outputs)
+target = 'cuda -libs=cudnn'
+with relay.build_config(opt_level=3):
+    graph, lib, params = relay.build(func, target, params=params)
 
 ```
 
@@ -252,8 +250,8 @@ def aten_sum(inputs, attributes, scope):
 
 ## Roadmap
 
-- [*] Deep integration between tensorrt and pytorch
-  - [*] Add a TensorRTModule to support train in pytorch, eval in tensorrt
+- [x] Deep integration between tensorrt and pytorch
+  - [x] Add a TensorRTModule to support train in pytorch, eval in tensorrt
 - [ ] Deep integration between tvm and pytorch
-  - [*] Add TVM support
+  - [x] Add TVM support
   - [ ] Add a TVMModule to support train in pytorch, eval in tvm (impossible for now)
