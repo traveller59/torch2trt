@@ -8,7 +8,6 @@ try:
     import tvm 
     from tvm.relay import expr as _expr
     from tvm.relay import op as _op
-    from tvm.relay import ir_pass
     from tvm import nd as _nd
 
 

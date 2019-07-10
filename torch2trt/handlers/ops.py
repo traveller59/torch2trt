@@ -9,24 +9,13 @@ from torch2trt.utils import print_inputs
 
 try:
     import tvm
+    from torch2trt.utils import infer_shape, infer_dtype
     from tvm.relay import expr as _expr
     from tvm.relay import op as _op
-    from tvm.relay import ir_pass
     from tvm import nd as _nd
 
 except ImportError:
     pass
-
-
-def _tvm_shape(tensor):
-    inp_shape = ir_pass.infer_type(tensor).checked_type.shape
-    inp_shape = [int(i) for i in inp_shape]
-    return inp_shape
-
-
-def _tvm_dtype(tensor):
-    inp_dtype = ir_pass.infer_type(tensor).checked_type.dtype
-    return inp_dtype
 
 
 @register_node_handler("aten::size")
@@ -42,7 +31,7 @@ def aten_size(inputs, attributes, scope):
         else:
             return [inputs[0].shape[inputs[1] - 1]]
     elif ctx.is_tvm and has_tvm_tensor(inputs):
-        inp_shape = _tvm_shape(inputs[0])
+        inp_shape = infer_shape(inputs[0])
         return [inp_shape[axis]]
     return [inputs[0].shape[inputs[1]]]
 
@@ -377,7 +366,7 @@ def aten_adaptive_avg_pool2d(inputs, attributes, scope):
         layer.name = scope
         return [output]
     elif ctx.is_tvm and has_tvm_tensor(inputs):
-        inp_shape = _tvm_shape(inp)
+        inp_shape = infer_shape(inp)
         inp_shape = inp_shape[2:]
         ksize = [i // k for i, k in zip(inp_shape, ksize)]
         assert all([i % k == 0 for i, k in zip(inp_shape, ksize)])
@@ -443,7 +432,7 @@ def _trt_torch_slice(net, inp, dim, start, end, step, name):
 
 
 def _tvm_torch_slice(inp, dim, start, end, step, name):
-    inp_shape = _tvm_shape(inp)
+    inp_shape = infer_shape(inp)
     ndim = len(inp_shape)
     starts = [0] * ndim
     ends = [0] * ndim
@@ -520,7 +509,7 @@ def _tvm_squeeze(inp, dim, name):
 
 
 def _tvm_unsqueeze(inp, dim, name):
-    inp_shape = _tvm_shape(inp)
+    inp_shape = infer_shape(inp)
     inp_shape = list(inp_shape)
     inp_shape.insert(dim, 1)
     return _op.reshape(inp, newshape=inp_shape)
@@ -664,7 +653,7 @@ def _tvm_to_const(args):
     ref_type = None
     for arg in args:
         if isinstance(arg, _expr.Expr):
-            ref_type = _tvm_dtype(arg)
+            ref_type = infer_dtype(arg)
     ttype = tvm_to_torchdtype(ref_type)
     res = []
     for arg in args:
@@ -931,7 +920,7 @@ def aten_transpose(inputs, attributes, scope):
         layer.name = scope
         return [output]
     elif ctx.is_tvm and has_tvm_tensor(inputs):
-        inp_shape = _tvm_shape(inp)
+        inp_shape = infer_shape(inp)
         params = list(range(len(inp_shape)))
         tmp = params[dim1]
         params[dim1] = params[dim0]
@@ -958,7 +947,8 @@ def aten_chunk(inputs, attributes, scope):
         return [outputs]
     elif ctx.is_tvm and has_tvm_tensor(inputs):
         outputs = []
-        step = inp.shape[dim] // chunk
+        shape = infer_shape(inp)
+        step = shape[dim] // chunk
         for i in range(chunk):
             out = _tvm_torch_slice(inp, dim, i * step, (i + 1) * step, 1,
                                    scope + "/slice_{}".format(i))
