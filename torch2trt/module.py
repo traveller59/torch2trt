@@ -31,7 +31,7 @@ class TensorRTModule(nn.Module):
 
     def build_tensorrt(self, net, torch_inputs):
         self.graph_pth = torch2trt.GraphModule(
-            net, *torch_inputs, param_exclude=self.param_exclude)
+            net, torch_inputs, param_exclude=self.param_exclude)
         self.output_names = []
         with trt.Builder(
                 self.logger) as builder, builder.create_network() as trt_net:
