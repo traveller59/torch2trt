@@ -1,5 +1,7 @@
 # torch2trt/torch2tvm: PyTorch Module Instance to TensorRT or TVM
 
+# WARNING: current code don't support pytorch v1.2, I will solve this issue as quickly as possible.
+
 ## Install
 
 1. install pytorch 1.1+
