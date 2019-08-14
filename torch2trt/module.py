@@ -46,7 +46,10 @@ class TensorRTModule(nn.Module):
                         shape=arg.shape[1:],
                         dtype=trt.float32)
                     inputs.append(inp)
-                outputs = self.graph_pth(*inputs, verbose=self.verbose)
+                if self.graph_pth.graph.is_class:
+                    outputs = self.graph_pth(net, *inputs, verbose=self.verbose)
+                else:
+                    outputs = self.graph_pth(*inputs, verbose=self.verbose)
             self.refit_weight_dict = self.graph_pth.graph.refit_weight_dict
             if not isinstance(outputs, (list, tuple)):
                 outputs = [outputs]
@@ -60,7 +63,10 @@ class TensorRTModule(nn.Module):
             self.ctx = self.engine.create_execution_context()
             self.ctx = torch2trt.TorchInferenceContext(self.ctx)
         # get output shapes
-        outputs = self.graph_pth(*torch_inputs)
+        if self.graph_pth.graph.is_class:
+            outputs = self.graph_pth(net, *torch_inputs)
+        else:
+            outputs = self.graph_pth(*torch_inputs)
         if not isinstance(outputs, (list, tuple)):
             outputs = [outputs]
         self.output_shapes = {}
@@ -69,7 +75,9 @@ class TensorRTModule(nn.Module):
 
     def refit_engine(self, net):
         with trt.Refitter(self.engine, self.logger) as refitter:
-            state_dict = net.state_dict()
+            # state_dict = net.state_dict()
+            state_dict = self.graph_pth.collect_params()
+            print(len(state_dict))
             variables = []
             # Why use a variable list?
             # we know that in c++ functions, a python array may be deleted

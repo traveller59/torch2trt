@@ -66,5 +66,14 @@ def aten_t(inputs, attributes, scope):
 
 @register_node_handler("prim::ListUnpack")
 def prim_list_unpack(inputs, attributes, scope):
-    inp = inputs[0]
     return [*inputs[0]]
+
+@register_node_handler("prim::GetAttr")
+def prim_get_attr(inputs, attributes, scope):
+    attr_name = attributes["name"]
+    attr = getattr(inputs[0], attr_name)
+    if isinstance(attr, torch.Tensor):
+        attr.__torch2trt_weight_name = scope
+    ctx = current_context()
+    ctx.torch_weight_dict.add(scope)
+    return [attr]

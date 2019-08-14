@@ -104,7 +104,7 @@ def benchmark_tvm(net, input_shape=(1, 3, 224, 224)):
 if __name__ == "__main__":
     # net = torchvision.models.inception_v3(pretrained=True).eval()
     # net = torchvision.models.vgg19_bn(pretrained=True).eval()
-    net = torchvision.models.resnet50(pretrained=True).eval()
+    net = torchvision.models.vgg11(pretrained=False).eval()
     # net = torchvision.models.squeezenet1_1(pretrained=True).eval()
     # benchmark_trt_torch(net, [1, 3, 224, 224])
-    benchmark_tvm(net, [1, 3, 224, 224])
+    benchmark_trt_torch(net, [1, 3, 224, 224])

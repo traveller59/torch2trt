@@ -40,7 +40,7 @@ methods_OP = [
 #   'type' (type <Tensor<class 'torch._C.Type'>>)
 #
 # But the below are sufficient for now.
-methods_IO = ['node', 'offset', 'uniqueName']
+methods_IO = ['node', 'offset', 'debugName']
 
 REGISTERED_NODE_HANDLERS = {}
 
@@ -49,6 +49,7 @@ class GlobalContext:
         self.network = network
         self.refit_weight_dict = {} # contains weight name map for trt engine refit
         self.tvm_weight_dict = OrderedDict() # contains tvm var to tvm ndarray
+        self.torch_weight_dict = set()
 
     @property
     def is_tensorrt(self):
@@ -152,7 +153,7 @@ def have_tensor(inputs):
 
 class NodeBase(object):
     def __init__(self,
-                 uniqueName=None,
+                 debugName=None,
                  inputs=None,
                  scope=None,
                  tensor_size=None,
@@ -160,7 +161,7 @@ class NodeBase(object):
                  attributes=''):
         # TODO; Specify a __slots__ for this class or potentially
         # used namedtuple instead
-        self.uniqueName = uniqueName
+        self.debugName = debugName
         self.inputs = inputs
         self.tensor_size = tensor_size
         self.kind = op_type
@@ -203,7 +204,7 @@ class NodePy(NodeBase):
                 io_unique_names = []
                 io_tensor_sizes = []
                 for n in list_of_node:
-                    io_unique_names.append(n.uniqueName())
+                    io_unique_names.append(n.debugName())
                     if n.type().kind() == 'CompleteTensorType':
                         io_tensor_sizes.append(n.type().sizes())
                     else:
@@ -280,6 +281,9 @@ class GraphPy(object):
         self.readable_name_to_node = {}
         self.refit_weight_dict = {}
         self.context = None
+        self.is_class = False
+        self.torch_weight_dict = set()
+        self.unique_name_to_name = {}
 
     def get_output_nodes_dict(self):
         nodes_dict = OrderedDict()
@@ -325,6 +329,14 @@ class GraphPy(object):
             **self.get_param_nodes_dict()
         }
 
+    def get_unique_name_to_node(self):
+        unique_name_to_node = {}
+        for node in self.nodes_op:
+            unique_name_to_node[node.readable_unique_name] = node
+        for k, node in self.nodes_io.items():
+            unique_name_to_node[node.readable_unique_name] = node
+        return unique_name_to_node
+
     def get_out_to_idx(self):
         out_to_idx = {}
         for node in self.nodes_op:
@@ -338,7 +350,7 @@ class GraphPy(object):
         return out_to_idx
 
     def get_output_names(self):
-        return [n.uniqueName for n in self.output_nodes]
+        return [n.debugName for n in self.output_nodes]
 
     def get_resolved_outputs(self):
         """return list of list: first list is list of outputs in net.forward,
@@ -355,7 +367,7 @@ class GraphPy(object):
 
     def append(self, x):
         if isinstance(x, NodePyIO):
-            self.nodes_io[x.uniqueName] = x
+            self.nodes_io[x.debugName] = x
         if isinstance(x, NodePyOP):
             self.nodes_op.append(x)
             for node_output, outputSize in zip(x.outputs,
@@ -398,14 +410,14 @@ class GraphPy(object):
         for key, node in self.nodes_io.items():
             if hasattr(node, 'input_or_output'):
                 self.unique_name_to_scoped_name[
-                    key] = node.input_or_output + '/' + node.uniqueName
+                    key] = node.input_or_output + '/' + node.debugName
             if hasattr(node, 'scope') and node.scope is not None:
                 self.unique_name_to_scoped_name[
-                    key] = node.scope + '/' + node.uniqueName
+                    key] = node.scope + '/' + node.debugName
                 if node.scope == '' and self.shallowest_scope_name:
                     self.unique_name_to_scoped_name[
                         node.
-                        uniqueName] = self.shallowest_scope_name + '/' + node.uniqueName
+                        debugName] = self.shallowest_scope_name + '/' + node.debugName
 
         # replace name
         for key, node in self.nodes_io.items():
@@ -413,10 +425,10 @@ class GraphPy(object):
                 self.unique_name_to_scoped_name[node_input_id]
                 for node_input_id in node.inputs
             ]
-            if node.uniqueName in self.unique_name_to_scoped_name:
+            if node.debugName in self.unique_name_to_scoped_name:
                 self.nodes_io[
-                    key].uniqueName = self.unique_name_to_scoped_name[
-                        node.uniqueName]
+                    key].debugName = self.unique_name_to_scoped_name[
+                        node.debugName]
 
 
 def _make_unique_name(unique_set, name, max_count=10000):
@@ -450,11 +462,14 @@ def parse(graph, num_inputs, omit_useless_nodes=False):
                     node.uses()
             ) == 0:  # number of user of the node (= number of outputs/ fanout)
                 continue
-
-        if i < n_inputs:
+        if node.debugName() == "self":
+            graph_py.is_class = True
+            num_inputs += 1
+        if i < num_inputs:
             graph_py.append(NodePyIO(node, 'input'))
-        else:
-            graph_py.append(NodePyIO(node))  # parameter
+        # else:
+        #     graph_py.append(NodePyIO(node))  # parameter
+        # print(node)
 
     for node in graph.nodes():
         graph_py.append(NodePyOP(node))
@@ -497,46 +512,30 @@ class UniqueNamePool:
     def __call__(self, name):
         return _make_unique_name(self.unique_set, name)
 
-def _get_jit_params(module, param_exclude, param_include):
-    state_dict = _unique_state_dict(module)
-    if param_exclude is not None:
-        param_exclude = re.compile(param_exclude)
-    if param_include is not None:
-        param_include = re.compile(param_include)
-
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        if param_exclude is not None and param_exclude.match(k) is not None:
-            continue
-        if param_include is not None and param_include.match(k) is None:
-            continue
-        if "num_batches_tracked" not in k:
-            if "weight" in k or "bias" in k or "running_mean" in k or "running_var" in k:
-                new_state_dict[k] = v
-    params = list(new_state_dict.values())[::-1]
-    return params, list(new_state_dict.keys())[::-1]
-
-
 def resolve_graph(graph_py: GraphPy, output_names, verbose=False):
     ctx = current_context()
     out_to_node = graph_py.get_out_to_node()
     out_to_idx = graph_py.get_out_to_idx()
+    unique_name_to_name = {}
     if not isinstance(output_names, (list, tuple)):
         output_names = [output_names]
     results = []
     for output_name in output_names:
         out_node = out_to_node[output_name]
+        unique_name_to_name[out_node.readable_unique_name] = output_name
         stack = [out_node]
         while len(stack) > 0:
             node = stack[-1]
             if node.resolved:
                 stack.pop()
                 continue
+            
             inputs = []
             input_nodes = []
             prepared = True
             for inp_name in node.inputs:
                 inp_node = out_to_node[inp_name]
+                unique_name_to_name[inp_node.readable_unique_name] = inp_name
                 if not inp_node.resolved:  # node isn't evaluated
                     stack.append(inp_node)
                     prepared = False
@@ -570,6 +569,9 @@ def resolve_graph(graph_py: GraphPy, output_names, verbose=False):
             stack.pop()
         results.append(out_node.resolved_outputs)
     graph_py.refit_weight_dict = ctx.refit_weight_dict
+    graph_py.torch_weight_dict = ctx.torch_weight_dict
+    graph_py.unique_name_to_name = unique_name_to_name
+    print(list(unique_name_to_name.keys()))
     return results
 
 def _torch_depoly(module,
@@ -611,16 +613,6 @@ def _torch_depoly(module,
     assert len(example_inputs) == len(graph_py.get_input_nodes_dict()), msg
     if output_names is None:
         output_names = graph_py.get_output_names()
-    if isinstance(module, torch.nn.Module):
-        params, weight_names = _get_jit_params(module, param_exclude, param_include)
-        num_param_inputs = len(graph_py.get_param_nodes())
-        msg = "expected {} params, but get {} params. ".format(
-            num_param_inputs, len(params))
-        msg += "This may due to your network have multi output. use param_exclude to remove them"
-        assert len(params) == num_param_inputs, msg
-        for pnode, param, name in zip(graph_py.get_param_nodes(), params, weight_names):
-            pnode.resolved_outputs[0] = param
-            pnode.__torch2trt_weight_name = name
     ctx = current_context()
     net = ctx.network
     if ctx.is_tensorrt:
@@ -720,21 +712,17 @@ class GraphModule:
         self.example_inputs = example_inputs
 
         msg = "input mismatch. this may due to some input isn't used in graph"
-        assert len(example_inputs) == len(graph_py.get_input_nodes_dict()), msg
-        if isinstance(module, torch.nn.Module):
-            params, weight_names = _get_jit_params(module, param_exclude, param_include)
-            num_param_inputs = len(graph_py.get_param_nodes())
-            msg = "expected {} params, but get {} params. ".format(
-                num_param_inputs, len(params))
-            msg += "This may due to your network have multi output. use param_exclude to remove them"
-            assert len(params) == num_param_inputs, msg
-            for pnode, param, name in zip(graph_py.get_param_nodes(), params, weight_names):
-                pnode.resolved_outputs[0] = param
-                setattr(param, "__torch2trt_weight_name", name)
+        # assert len(example_inputs) == len(graph_py.get_input_nodes_dict()), msg
 
     def __call__(self, *args, verbose=False, **kw):
         assert len(kw) == 0, "don't support kw arg"
-        assert all([isinstance(e, (torch.Tensor, trt.ITensor)) for e in args])
+        if self.graph.is_class:
+            assert isinstance(args[0], torch.nn.Module)
+            assert all([isinstance(e, (torch.Tensor, trt.ITensor)) for e in args[1:]])
+            args_for_assert = args[1:]
+        else:
+            assert all([isinstance(e, (torch.Tensor, trt.ITensor)) for e in args])
+            args_for_assert = args
         assert len(args) == len(self.graph.get_input_nodes_dict())
         output_names = self.graph.get_output_names()
         for output_name in output_names:
@@ -743,14 +731,21 @@ class GraphModule:
             inode.resolved_outputs[0] = args[i]
         if has_trt_tensor(args):
             # trt mode
-            assert all([isinstance(e, trt.ITensor) for e in args])
+            assert all([isinstance(e, trt.ITensor) for e in args_for_assert])
             assert current_context().is_tensorrt
         elif has_tvm_tensor(args):
-            assert all([isinstance(e, _expr.Expr) for e in args])
+            assert all([isinstance(e, _expr.Expr) for e in args_for_assert])
             assert current_context().is_tvm
         else:
-            assert all([isinstance(e, torch.Tensor) for e in args])
+            assert all([isinstance(e, torch.Tensor) for e in args_for_assert])
             assert current_context().is_torch, "you should run pytorch mode outside trt_network block"
         resolve_graph(self.graph, output_names, verbose)
         return self.graph.get_resolved_outputs()
+
+    def collect_params(self):
+        unique_output_names = list(self.graph.torch_weight_dict)
+        output_names = [self.graph.unique_name_to_name[n] for n in unique_output_names]
+        resolve_graph(self.graph, output_names)
+        res = self.graph.get_resolved_outputs()
+        return {k: v for k, v in zip(output_names, res)}
 
