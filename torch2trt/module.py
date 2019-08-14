@@ -12,7 +12,6 @@ class TensorRTModule(nn.Module):
                  max_batchsize,
                  workspace,
                  dtype=trt.float32,
-                 param_exclude=None,
                  verbose=False):
         super().__init__()
         self.max_batchsize = max_batchsize
@@ -21,17 +20,15 @@ class TensorRTModule(nn.Module):
         self.built = False
         self.graph_pth = None
         self.refit_weight_dict = {}
-        self.param_exclude = param_exclude
         self.engine = None
         self.ctx = None
         self.output_shapes = None
         self.output_names = None
-        self.need_refit = True
+        self.need_refit = False
         self.verbose = verbose
 
     def build_tensorrt(self, net, torch_inputs):
-        self.graph_pth = torch2trt.GraphModule(
-            net, torch_inputs, param_exclude=self.param_exclude)
+        self.graph_pth = torch2trt.GraphModule(net, torch_inputs)
         self.output_names = []
         with trt.Builder(
                 self.logger) as builder, builder.create_network() as trt_net:
@@ -46,10 +43,7 @@ class TensorRTModule(nn.Module):
                         shape=arg.shape[1:],
                         dtype=trt.float32)
                     inputs.append(inp)
-                if self.graph_pth.graph.is_class:
-                    outputs = self.graph_pth(net, *inputs, verbose=self.verbose)
-                else:
-                    outputs = self.graph_pth(*inputs, verbose=self.verbose)
+                outputs = self.graph_pth(*inputs, verbose=self.verbose)
             self.refit_weight_dict = self.graph_pth.graph.refit_weight_dict
             if not isinstance(outputs, (list, tuple)):
                 outputs = [outputs]
@@ -63,10 +57,7 @@ class TensorRTModule(nn.Module):
             self.ctx = self.engine.create_execution_context()
             self.ctx = torch2trt.TorchInferenceContext(self.ctx)
         # get output shapes
-        if self.graph_pth.graph.is_class:
-            outputs = self.graph_pth(net, *torch_inputs)
-        else:
-            outputs = self.graph_pth(*torch_inputs)
+        outputs = self.graph_pth(*torch_inputs)
         if not isinstance(outputs, (list, tuple)):
             outputs = [outputs]
         self.output_shapes = {}
@@ -74,11 +65,12 @@ class TensorRTModule(nn.Module):
             self.output_shapes[n] = v.shape[1:]
 
     def refit_engine(self, net):
+        print("TensorRT refit seems not working with batchnorm. so disable it for now.")
+        raise NotImplementedError
+        variables = []
         with trt.Refitter(self.engine, self.logger) as refitter:
-            # state_dict = net.state_dict()
-            state_dict = self.graph_pth.collect_params()
-            print(len(state_dict))
-            variables = []
+            net = net.eval()
+            state_dict = self.graph_pth.collect_params(net)
             # Why use a variable list?
             # we know that in c++ functions, a python array may be deleted
             # after ref count of a var decrease to zero.
@@ -115,8 +107,10 @@ class TensorRTModule(nn.Module):
                     shift = (-running_mean /
                              np.sqrt(running_var + eps)) * weight + bias
                     scale = weight / np.sqrt(running_var + eps)
-                    refitter.set_weights(k, trt.WeightsRole.SCALE, scale)
+                    shift = np.ascontiguousarray(shift.astype(np.float32))
+                    scale = np.ascontiguousarray(scale.astype(np.float32))
                     refitter.set_weights(k, trt.WeightsRole.SHIFT, shift)
+                    refitter.set_weights(k, trt.WeightsRole.SCALE, scale)
                     variables.append(scale)
                     variables.append(shift)
                 else:
@@ -135,6 +129,7 @@ class TensorRTModule(nn.Module):
         if not self.training and not self.built:
             self.build_tensorrt(self, args)
             self.built = True
+            self.need_refit = False
         if not self.training:
             if self.need_refit:
                 self.refit_engine(self)
@@ -160,9 +155,8 @@ class TensorRTModuleWrapper(TensorRTModule):
                  max_batchsize,
                  workspace,
                  dtype=trt.float32,
-                 param_exclude=None,
                  verbose=False):
-        super().__init__(max_batchsize, workspace, dtype, param_exclude, verbose)
+        super().__init__(max_batchsize, workspace, dtype, verbose)
         self.net = net
 
     def forward(self, *args, **kw):
@@ -172,6 +166,7 @@ class TensorRTModuleWrapper(TensorRTModule):
         if not self.training and not self.built:
             self.build_tensorrt(self.net, args)
             self.built = True
+            self.need_refit = False
         if not self.training:
             if self.need_refit:
                 self.refit_engine(self.net)
@@ -195,11 +190,9 @@ class TensorRTModuleWrapper(TensorRTModule):
 
 
 class TVMModule(nn.Module):
-    def __init__(self,
-                 param_exclude=None):
+    def __init__(self):
         super().__init__()
         self.built = False
         self.graph_pth = None
         self.refit_weight_dict = {}
-        self.param_exclude = param_exclude
         self.tvm_ctx = None

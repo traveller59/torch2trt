@@ -49,7 +49,8 @@ class GlobalContext:
         self.network = network
         self.refit_weight_dict = {} # contains weight name map for trt engine refit
         self.tvm_weight_dict = OrderedDict() # contains tvm var to tvm ndarray
-        self.torch_weight_dict = set()
+        self.torch_weight_nodes_dict = {}
+        self.current_node = None
 
     @property
     def is_tensorrt(self):
@@ -62,6 +63,7 @@ class GlobalContext:
     @property
     def is_tvm(self):
         return self.network == "tvm"
+
 
 CURRENT_CONTEXT = GlobalContext(None)  # when None, will use pytorch debug mode.
 
@@ -282,7 +284,7 @@ class GraphPy(object):
         self.refit_weight_dict = {}
         self.context = None
         self.is_class = False
-        self.torch_weight_dict = set()
+        self.torch_weight_nodes_dict = set()
         self.unique_name_to_name = {}
 
     def get_output_nodes_dict(self):
@@ -443,7 +445,7 @@ def _make_unique_name(unique_set, name, max_count=10000):
     raise ValueError("max count reached")
 
 
-def parse(graph, num_inputs, omit_useless_nodes=False):
+def parse(graph, num_inputs, omit_useless_nodes=False, is_class=False):
     """This method parses an optimized PyTorch model graph and produces
     a list of nodes and node stats for eventual conversion to TensorBoard
     protobuf format.
@@ -453,18 +455,17 @@ def parse(graph, num_inputs, omit_useless_nodes=False):
       omit_useless_nodes (boolean): Whether to remove nodes from the graph.
     """
     n_inputs = num_inputs
-
+    if is_class:
+        num_inputs += 1
     scope = {}
     graph_py = GraphPy()
+    graph_py.is_class = is_class
     for i, node in enumerate(graph.inputs()):
         if omit_useless_nodes:
             if len(
                     node.uses()
             ) == 0:  # number of user of the node (= number of outputs/ fanout)
                 continue
-        if node.debugName() == "self":
-            graph_py.is_class = True
-            num_inputs += 1
         if i < num_inputs:
             graph_py.append(NodePyIO(node, 'input'))
         # else:
@@ -516,13 +517,14 @@ def resolve_graph(graph_py: GraphPy, output_names, verbose=False):
     ctx = current_context()
     out_to_node = graph_py.get_out_to_node()
     out_to_idx = graph_py.get_out_to_idx()
-    unique_name_to_name = {}
     if not isinstance(output_names, (list, tuple)):
         output_names = [output_names]
-    results = []
+    node_results = []
     for output_name in output_names:
-        out_node = out_to_node[output_name]
-        unique_name_to_name[out_node.readable_unique_name] = output_name
+        if not isinstance(output_name, str):
+            out_node = output_name
+        else:
+            out_node = out_to_node[output_name]
         stack = [out_node]
         while len(stack) > 0:
             node = stack[-1]
@@ -535,7 +537,6 @@ def resolve_graph(graph_py: GraphPy, output_names, verbose=False):
             prepared = True
             for inp_name in node.inputs:
                 inp_node = out_to_node[inp_name]
-                unique_name_to_name[inp_node.readable_unique_name] = inp_name
                 if not inp_node.resolved:  # node isn't evaluated
                     stack.append(inp_node)
                     prepared = False
@@ -550,8 +551,10 @@ def resolve_graph(graph_py: GraphPy, output_names, verbose=False):
                     msg += "{}==>>".format(pretty_str(inputs))
             try:
                 handler = get_node_handler(node.kind)
+                ctx.current_node = node
                 results = handler(inputs, node.attributes,
                                   node.readable_unique_name)
+                ctx.current_node = None
             except Exception as e:
                 print(node.readable_unique_name)
                 if verbose:
@@ -567,17 +570,14 @@ def resolve_graph(graph_py: GraphPy, output_names, verbose=False):
             node.resolved_outputs = list(results)
             node.resolved = True
             stack.pop()
-        results.append(out_node.resolved_outputs)
+        
+        node_results.append(out_node.resolved_outputs)
     graph_py.refit_weight_dict = ctx.refit_weight_dict
-    graph_py.torch_weight_dict = ctx.torch_weight_dict
-    graph_py.unique_name_to_name = unique_name_to_name
-    print(list(unique_name_to_name.keys()))
-    return results
+    graph_py.torch_weight_nodes_dict = ctx.torch_weight_nodes_dict
+    return node_results
 
 def _torch_depoly(module,
               example_inputs,
-              param_exclude=None,
-              param_include=None,
               output_names=None,
               input_tensors=None,
               input_names=None,
@@ -588,8 +588,6 @@ def _torch_depoly(module,
         module: pytorch nn.Module or function.
         example_inputs: list or tuple of example tensors. MUST match arguments of 
             forward function of module.
-        param_exclude: regex string. filter unused weights and buffers if match.
-        param_include: regex string. filter unused weights and buffers if not match.
         output_names: list of string. indicate output node name you want to use.
             note that pytorch jit node name don't contains any readable information.
             so I recommend not use this.
@@ -607,10 +605,11 @@ def _torch_depoly(module,
     trace = torch.jit.trace(module, example_inputs, True)
     if not isinstance(example_inputs, (list, tuple)):
         example_inputs = [example_inputs]
+    is_class = isinstance(module, torch.nn.Module)
     graph_py = parse(
-        trace.graph, len(example_inputs), omit_useless_nodes=False)
+        trace.graph, len(example_inputs), omit_useless_nodes=False, is_class=is_class)
     msg = "input mismatch. this may due to some input isn't used in graph"
-    assert len(example_inputs) == len(graph_py.get_input_nodes_dict()), msg
+    assert len(example_inputs) + int(is_class) == len(graph_py.get_input_nodes_dict()), msg
     if output_names is None:
         output_names = graph_py.get_output_names()
     ctx = current_context()
@@ -621,11 +620,13 @@ def _torch_depoly(module,
             input_names = [input_names]
         assert len(input_names) == len(example_inputs)
         inputs = []
+        if is_class:
+            inputs = [module]
         if input_tensors is not None:
             if not isinstance(input_tensors, (list, tuple)):
                 input_tensors = [input_tensors]
             assert len(input_tensors) == len(example_inputs)
-            inputs = input_tensors
+            inputs += input_tensors
         else:
             for torch_inp, name in zip(example_inputs, input_names):
                 tensor = net.add_input(
@@ -641,11 +642,13 @@ def _torch_depoly(module,
             input_names = [input_names]
         assert len(input_names) == len(example_inputs)
         inputs = []
+        if is_class:
+            inputs = [module]
         if input_tensors is not None:
             if not isinstance(input_tensors, (list, tuple)):
                 input_tensors = [input_tensors]
             assert len(input_tensors) == len(example_inputs)
-            inputs = input_tensors
+            inputs += input_tensors
         else:
             for torch_inp, name in zip(example_inputs, input_names):
                 tensor = _expr.var(name, shape=torch_inp.shape, dtype="float32")
@@ -665,8 +668,11 @@ torch2tvm = _torch_depoly
 torch2trt = _torch_depoly
 
 def clean_resolved_outputs(graph_py, output_name):
-    out_to_node = graph_py.get_out_to_node()
-    out_node = out_to_node[output_name]
+    if not isinstance(output_name, str):
+        out_node = output_name
+    else:
+        out_to_node = graph_py.get_out_to_node()
+        out_node = out_to_node[output_name]
 
     def recursive_resolve(node: NodePy):
         if isinstance(node, NodePyOP):
@@ -689,63 +695,64 @@ class GraphModule:
         module: pytorch nn.Module or function.
         example_inputs: list or tuple of example tensors. MUST match arguments of 
             forward function of module.
-        param_exclude: regex string. filter unused weights and buffers if match.
-        param_include: regex string. filter unused weights and buffers if not match.
     """
     def __init__(self,
                  module,
-                 example_inputs,
-                 param_exclude=None,
-                 param_include=None):
+                 example_inputs):
 
         super().__init__()
         self.module = module
+        is_class = isinstance(module, torch.nn.Module)
+
         trace = torch.jit.trace(module, example_inputs, True)
         if not isinstance(example_inputs, (list, tuple)):
             example_inputs = [example_inputs]
         graph_py = parse(
-            trace.graph, len(example_inputs), omit_useless_nodes=False)
+            trace.graph, len(example_inputs), omit_useless_nodes=False, is_class=is_class)
         self.graph = graph_py
         self.trace = trace
-        self.param_exclude = param_exclude
-        self.param_include = param_include
         self.example_inputs = example_inputs
 
         msg = "input mismatch. this may due to some input isn't used in graph"
-        # assert len(example_inputs) == len(graph_py.get_input_nodes_dict()), msg
+        assert len(example_inputs) + int(is_class) == len(graph_py.get_input_nodes_dict()), msg
 
     def __call__(self, *args, verbose=False, **kw):
         assert len(kw) == 0, "don't support kw arg"
-        if self.graph.is_class:
-            assert isinstance(args[0], torch.nn.Module)
-            assert all([isinstance(e, (torch.Tensor, trt.ITensor)) for e in args[1:]])
-            args_for_assert = args[1:]
-        else:
-            assert all([isinstance(e, (torch.Tensor, trt.ITensor)) for e in args])
-            args_for_assert = args
-        assert len(args) == len(self.graph.get_input_nodes_dict())
+        assert all([isinstance(e, (torch.Tensor, trt.ITensor)) for e in args])
+        assert len(args) + int(self.graph.is_class) == len(self.graph.get_input_nodes_dict())
         output_names = self.graph.get_output_names()
         for output_name in output_names:
             clean_resolved_outputs(self.graph, output_name)
+        args = list(args)
+        arg_for_check = args
+        if self.graph.is_class:
+            args.insert(0, self.module)
+            arg_for_check = args[1:]
         for i, inode in enumerate(self.graph.get_input_nodes_dict().values()):
             inode.resolved_outputs[0] = args[i]
-        if has_trt_tensor(args):
+        if has_trt_tensor(arg_for_check):
             # trt mode
-            assert all([isinstance(e, trt.ITensor) for e in args_for_assert])
+            assert all([isinstance(e, trt.ITensor) for e in arg_for_check])
             assert current_context().is_tensorrt
-        elif has_tvm_tensor(args):
-            assert all([isinstance(e, _expr.Expr) for e in args_for_assert])
+        elif has_tvm_tensor(arg_for_check):
+            assert all([isinstance(e, _expr.Expr) for e in arg_for_check])
             assert current_context().is_tvm
         else:
-            assert all([isinstance(e, torch.Tensor) for e in args_for_assert])
+            assert all([isinstance(e, torch.Tensor) for e in arg_for_check])
             assert current_context().is_torch, "you should run pytorch mode outside trt_network block"
         resolve_graph(self.graph, output_names, verbose)
         return self.graph.get_resolved_outputs()
 
-    def collect_params(self):
-        unique_output_names = list(self.graph.torch_weight_dict)
-        output_names = [self.graph.unique_name_to_name[n] for n in unique_output_names]
-        resolve_graph(self.graph, output_names)
-        res = self.graph.get_resolved_outputs()
-        return {k: v for k, v in zip(output_names, res)}
+    def collect_params(self, net):
+        """rerun graph in pytorch mode and collect new params
+        """
+        self.graph.torch_weight_nodes_dict = {}
+        output_names = self.graph.get_output_names()
+        for name in output_names:
+            clean_resolved_outputs(self.graph, name)
+        with torch.no_grad():
+            self(net, *self.example_inputs)
+        return self.graph.torch_weight_nodes_dict
 
+    def collect_params_v1(self):
+        return self.graph.torch_weight_nodes_dict

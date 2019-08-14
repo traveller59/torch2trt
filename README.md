@@ -1,10 +1,8 @@
 # torch2trt/torch2tvm: PyTorch Module Instance to TensorRT or TVM
 
-# WARNING: current code don't support pytorch v1.2, I will solve this issue as quickly as possible.
-
 ## Install
 
-1. install pytorch 1.1+
+1. install pytorch 1.2+ (if you use pytorch 1.1, consider torch-1.1 branch)
 
 2. download TensorRT 5.1.2.2+, install tensorrt python package, add TensorRT libraries to LD_LIBRARY_PATH.
 
@@ -49,7 +47,7 @@ class TensorRTExample(torch2trt.TensorRTModule):
     """This module will use tensorrt in eval mode, pytorch in train mode
     """
     def __init__(self):
-        super().__init__(max_batchsize, max_trt_workspace, param_exclude=".*AuxLogits.*")
+        super().__init__(max_batchsize, max_trt_workspace)
         self.net = torchvision.models.resnet50(pretrained=True)
 
     def forward(self, x):
@@ -57,7 +55,7 @@ class TensorRTExample(torch2trt.TensorRTModule):
 
 class SubTensorRTExample(nn.Module):
     def __init__(self):
-        super().__init__(max_batchsize, max_trt_workspace, param_exclude=".*AuxLogits.*")
+        super().__init__(max_batchsize, max_trt_workspace)
         self.net = TensorRTExample()
         self.conv2d = nn.Conv2d(3, 3, 3)
 
@@ -67,7 +65,7 @@ class SubTensorRTExample(nn.Module):
         return self.conv2d(self.net(x)) 
 
 inputs = torch.rand(1, 3, 299, 299).float().cuda()
-net_trt = torch2trt.TensorRTModuleWrapper(net, max_batchsize, max_trt_workspace, param_exclude=".*AuxLogits.*").cuda().eval()
+net_trt = torch2trt.TensorRTModuleWrapper(net, max_batchsize, max_trt_workspace).cuda().eval()
 out_ref = net(inputs)
 out = net_trt(inputs)
 print(torch.norm(out - out_ref))
@@ -87,14 +85,14 @@ TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
 net = torchvision.models.inception_v3(pretrained=True).eval()
 inputs = torch.rand(1, 3, 299, 299)
-graph_pth = torch2trt.GraphModule(net, inputs, param_exclude=".*AuxLogits.*")
+graph_pth = torch2trt.GraphModule(net, inputs)
 # run in pytorch debug mode, like torch_net(...)
 torch_mode_out = graph_pth(inputs)
 # you can convert another module or function:
 def toy_example(x):
     return torch.softmax(x, 1), torch.sigmoid(x)
 graph_pth_toy = torch2trt.GraphModule(toy_example, torch_mode_out)
-probs, sigmoid = graph_pth_toy(torch_mode_out, verbose=True)
+probs, sigmoid = graph_pth_toy(torch_mode_out, verbose=True) # don't need nn.Module here.
 
 with trt.Builder(TRT_LOGGER) as builder, builder.create_network() as trt_net:
     builder.max_workspace_size = 1 << 30
@@ -166,15 +164,13 @@ from tvm.contrib import graph_runtime
 import tvm
 from tvm.relay import expr, ir_pass
 from tvm import relay
-param_exclude = ".*AuxLogits.*"  # for inception v3
 inputs = torch.rand(*input_shape).float()
 with torch2trt.core.tvm_network():
     trace, graph_pth = torch2trt.core.torch2tvm(
         net,
         inputs,
         input_names=["image"],
-        verbose=True,
-        param_exclude=param_exclude)
+        verbose=True)
 
 outputs = graph_pth.get_resolved_outputs()
 tvm_weight_dict = graph_pth.context.tvm_weight_dict
@@ -189,10 +185,6 @@ with relay.build_config(opt_level=3):
 * Inputs and Outputs
 
 Inputs is inputs of net.forward, Outputs is outputs of net.forward.
-
-* ```param_exclude``` and ```param_include```
-
-torch2trt can't convert module with unused weights and buffers. if your module contains them, you need to use regex string to filter them.
 
 ### Add new handler
 
@@ -246,14 +238,11 @@ def aten_sum(inputs, attributes, scope):
 
 * write fused custom c++ jit operators for unsupported operations, also need to write a corresponding TensorRT plugin.
 
-* don't add unused modules with weights to nn.Module. if you can't modify module code, use ```param_exclude``` in torch2trt to remove them.
-
-* if your custom module have weights, you MUST use name contains "weight" or "bias", otherwise these weights will be filtered and cause error.
-
 ## Roadmap
 
 - [x] Deep integration between tensorrt and pytorch
   - [x] Add a TensorRTModule to support train in pytorch, eval in tensorrt
+- [ ] Add support for simple tensorrt plugin creation
 - [ ] Deep integration between tvm and pytorch
   - [x] Add TVM support
   - [ ] Add a TVMModule to support train in pytorch, eval in tvm (impossible for now)

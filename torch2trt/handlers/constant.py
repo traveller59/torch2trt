@@ -31,6 +31,9 @@ def prim_num_to_tensor(inputs, attributes, scope):
 def prim_int(inputs, attributes, scope):
     return [int(inputs[0])]
 
+@register_node_handler("aten::Int")
+def aten_int(inputs, attributes, scope):
+    return [int(inputs[0])]
 
 @register_node_handler("aten::to")
 def aten_to(inputs, attributes, scope):
@@ -72,8 +75,8 @@ def prim_list_unpack(inputs, attributes, scope):
 def prim_get_attr(inputs, attributes, scope):
     attr_name = attributes["name"]
     attr = getattr(inputs[0], attr_name)
+    ctx = current_context()
     if isinstance(attr, torch.Tensor):
         attr.__torch2trt_weight_name = scope
-    ctx = current_context()
-    ctx.torch_weight_dict.add(scope)
+        ctx.torch_weight_nodes_dict[scope] = attr
     return [attr]

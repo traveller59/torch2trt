@@ -1016,7 +1016,7 @@ def aten_constant_pad_nd(inputs, attributes, scope):
 
 @register_node_handler("aten::softmax")
 def aten_softmax(inputs, attributes, scope):
-    inp, axis = inputs
+    inp, axis, dtype = inputs[:3]
     ctx = current_context()
     net = ctx.network
     if ctx.is_tensorrt and has_trt_tensor(inputs):
@@ -1029,7 +1029,7 @@ def aten_softmax(inputs, attributes, scope):
         return [output]
     elif ctx.is_tvm and has_tvm_tensor(inputs):
         return [_op.nn.softmax(inputs[0], axis=axis)]
-    return [F.softmax(inp, axis)]
+    return [F.softmax(inp, axis, dtype)]
 
 
 @register_node_handler("aten::index_select")

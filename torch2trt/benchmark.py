@@ -12,12 +12,10 @@ from tvm import relay
 
 def benchmark_trt_torch(net, input_shape=(1, 3, 224, 224)):
     net = net.float().cuda()
-    param_exclude = ".*AuxLogits.*"  # for inception v3
     net_trt = torch2trt.TensorRTModuleWrapper(
         net,
         input_shape[0],
         1 << 30,
-        param_exclude=param_exclude,
         verbose=True).eval()
     net_trt = net_trt.float().cuda()
     inputs = torch.rand(*input_shape).float().cuda()
@@ -72,15 +70,13 @@ class TVMInferenceContext:
 
 
 def benchmark_tvm(net, input_shape=(1, 3, 224, 224)):
-    param_exclude = ".*AuxLogits.*"  # for inception v3
     inputs = torch.rand(*input_shape).float()
     with torch2trt.core.tvm_network():
         trace, graph_pth = torch2trt.core.torch2tvm(
             net,
             inputs,
             input_names=["image"],
-            verbose=True,
-            param_exclude=param_exclude)
+            verbose=True)
 
     outputs = graph_pth.get_resolved_outputs()
     tvm_weight_dict = graph_pth.context.tvm_weight_dict
@@ -104,7 +100,7 @@ def benchmark_tvm(net, input_shape=(1, 3, 224, 224)):
 if __name__ == "__main__":
     # net = torchvision.models.inception_v3(pretrained=True).eval()
     # net = torchvision.models.vgg19_bn(pretrained=True).eval()
-    net = torchvision.models.vgg11(pretrained=False).eval()
+    net = torchvision.models.resnet50(pretrained=False).eval()
     # net = torchvision.models.squeezenet1_1(pretrained=True).eval()
     # benchmark_trt_torch(net, [1, 3, 224, 224])
     benchmark_trt_torch(net, [1, 3, 224, 224])

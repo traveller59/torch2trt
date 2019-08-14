@@ -18,11 +18,11 @@ URL = 'https://github.com/traveller59/torch2trt'
 EMAIL = 'scrin@foxmail.com'
 AUTHOR = 'Yan Yan'
 REQUIRES_PYTHON = '>=3.6.0'
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 
 # What packages are required for this module to be executed?
 REQUIRED = [
-    'torch>=1.1.0', 'tensorrt',
+    'torch>=1.2.0', 'tensorrt',
 ]
 
 # What packages are optional?
