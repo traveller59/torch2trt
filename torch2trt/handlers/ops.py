@@ -416,6 +416,19 @@ def aten_dropout(inputs, attributes, scope):
     res = F.dropout2d(inp, rate, bool(training))
     return [res]
 
+@register_node_handler("aten::dropout_")
+def aten_dropout_(inputs, attributes, scope):
+    inp = inputs[0]
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
+        return [inputs[0]]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        return [inputs[0]]
+    rate, training = inputs[1:3]
+    res = F.dropout2d(inp, rate, bool(training), inplace=True)
+    return [res]
+
 
 @register_node_handler("aten::cat")
 def aten_cat(inputs, attributes, scope):
@@ -806,7 +819,7 @@ def _axes_to_trt_axis(axes, ndim):
 
 @register_node_handler("aten::sum")
 def aten_sum(inputs, attributes, scope):
-    inp, dim, keepdim = inputs
+    inp, dim, keepdim = inputs[:3]
     ctx = current_context()
     net = ctx.network
     if ctx.is_tensorrt and has_trt_tensor(inputs):
@@ -827,7 +840,7 @@ def aten_sum(inputs, attributes, scope):
 
 @register_node_handler("aten::max")
 def aten_max(inputs, attributes, scope):
-    inp, dim, keepdim = inputs
+    inp, dim, keepdim = inputs[:3]
     ctx = current_context()
     net = ctx.network
     if ctx.is_tensorrt and has_trt_tensor(inputs):
@@ -848,7 +861,7 @@ def aten_max(inputs, attributes, scope):
 
 @register_node_handler("aten::min")
 def aten_min(inputs, attributes, scope):
-    inp, dim, keepdim = inputs
+    inp, dim, keepdim = inputs[:3]
     ctx = current_context()
     net = ctx.network
     if ctx.is_tensorrt and has_trt_tensor(inputs):
@@ -869,7 +882,7 @@ def aten_min(inputs, attributes, scope):
 
 @register_node_handler("aten::mean")
 def aten_mean(inputs, attributes, scope):
-    inp, dim, keepdim = inputs
+    inp, dim, keepdim = inputs[:3]
     ctx = current_context()
     net = ctx.network
     if ctx.is_tensorrt and has_trt_tensor(inputs):
@@ -890,7 +903,7 @@ def aten_mean(inputs, attributes, scope):
 
 @register_node_handler("aten::prod")
 def aten_prod(inputs, attributes, scope):
-    inp, dim, keepdim = inputs
+    inp, dim, keepdim = inputs[:3]
     ctx = current_context()
     net = ctx.network
     if ctx.is_tensorrt and has_trt_tensor(inputs):

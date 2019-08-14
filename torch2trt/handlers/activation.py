@@ -1,10 +1,13 @@
+import numpy as np
 import tensorrt as trt
 import torch
 from torch.nn import functional as F
+
 from torch2trt.core import (current_context, has_trt_tensor, has_tvm_tensor,
                             register_node_handler)
-from torch2trt.utils import print_inputs
 from torch2trt.handlers.ops import _scale_or_elementwise
+from torch2trt.utils import print_inputs
+
 try:
     import tvm 
     from tvm.relay import expr as _expr
@@ -183,18 +186,16 @@ def aten_hardtanh(inputs, attributes, scope):
         layer = net.add_activation(inp, trt.ActivationType.RELU)
         output = layer.get_output(0)
         layer.name = scope + "/relu"
-        inp_sub_6 = _scale_or_elementwise(net, inp, torch.tensor(max_val), "sub", scope + "/sub")
-        layer = net.add_activation(inp_sub_6, trt.ActivationType.RELU)
-        layer.name = scope + "/relu(x-6)"
-        output_6 = layer.get_output(0)
-        output = _scale_or_elementwise(net, output, output_6, "sub", scope + "/sub_relu")
-        output.name = scope
+        tensor = np.full([1] * len(inp.shape), max_val, dtype=np.float32)
+        trt_6 = ctx.network.add_constant([1] * len(inp.shape), tensor)
+        layer = ctx.network.add_elementwise(output, trt_6.get_output(0), trt.ElementWiseOperation.MIN)
+        output = layer.get_output(0)
+        layer.name = scope + "/elem_min"
+        output.name = scope + "/relu6"
         return [output]
     elif ctx.is_tvm and has_tvm_tensor(inputs):
         raise NotImplementedError
-
     return [F.hardtanh(inp, min_val, max_val)]
-
 
 @register_node_handler("aten::hardtanh_")
 def aten_hardtanh_(inputs, attributes, scope):
@@ -207,36 +208,13 @@ def aten_hardtanh_(inputs, attributes, scope):
         layer = net.add_activation(inp, trt.ActivationType.RELU)
         output = layer.get_output(0)
         layer.name = scope + "/relu"
-        inp_sub_6 = _scale_or_elementwise(net, inp, torch.tensor(max_val), "sub", scope + "/sub")
-        layer = net.add_activation(inp_sub_6, trt.ActivationType.RELU)
-        layer.name = scope + "/relu(x-6)"
-        output_6 = layer.get_output(0)
-        output = _scale_or_elementwise(net, output, output_6, "sub", scope + "/sub_relu")
-        output.name = scope
+        tensor = np.full([1] * len(inp.shape), max_val, dtype=np.float32)
+        trt_6 = ctx.network.add_constant([1] * len(inp.shape), tensor)
+        layer = ctx.network.add_elementwise(output, trt_6.get_output(0), trt.ElementWiseOperation.MIN)
+        output = layer.get_output(0)
+        layer.name = scope + "/elem_min"
+        output.name = scope + "/relu6"
         return [output]
     elif ctx.is_tvm and has_tvm_tensor(inputs):
         raise NotImplementedError
-
     return [F.hardtanh_(inp, min_val, max_val)]
-
-
-"""
-@register_node_handler("aten::hardtanh_")
-def aten_hardtanh_(inputs, attributes, scope):
-    inp, min_val, max_val = inputs[:3]
-    net = current_context().network
-    if net is not None and has_trt_tensor(inputs):
-        # use relu(x) - relu(x - 6) to implement relu6 (subset of hardtanh)
-        assert min_val == 0
-        alpha = 1 / max_val
-        beta = 0
-        layer = net.add_activation(inp, trt.ActivationType.HARD_SIGMOID)
-        layer.alpha = alpha 
-        layer.beta = beta
-        output = layer.get_output(0)
-        output.name = scope
-        layer.name = scope
-        output = _scale_or_elementwise(net, output, torch.tensor(max_val), "mul", scope + "/mul")
-        return [output]
-    return [F.hardtanh_(inp, min_val, max_val)]
-"""
