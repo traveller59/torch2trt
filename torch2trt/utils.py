@@ -1,5 +1,6 @@
 import torch 
 import tensorrt as trt
+import inspect
 
 TVM_ENABLE = False
 
@@ -58,4 +59,11 @@ def pretty_str(obj):
         msg += str(obj)
     return msg
 
-
+def get_torch_forward_name(func):
+    sig = inspect.signature(func)
+    params = sig.parameters # skip self
+    res = []
+    for k, p in params.items():
+        assert p.kind is p.POSITIONAL_OR_KEYWORD
+        res.append(k)
+    return res

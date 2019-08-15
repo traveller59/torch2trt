@@ -22,7 +22,6 @@ except ImportError:
 def aten_size(inputs, attributes, scope):
     axis = inputs[1]
     ctx = current_context()
-    net = current_context().network
     if ctx.is_tensorrt and has_trt_tensor(inputs):
         # trt tensor shape don't include batch axis
         if axis == 0:
@@ -148,11 +147,13 @@ def aten_convolution(inputs, attributes, scope):
         weight_t = _expr.var(
             scope + "/weight", shape=weight.shape, dtype="float32")
         ctx.tvm_weight_dict[weight_t] = weight
+        ctx.refit_weight_dict[weight_t.name_hint] = inputs[1].__torch2trt_weight_name
         if bias is not None:
             bias = bias.detach().cpu().numpy()
             bias_t = _expr.var(
                 scope + "/bias", shape=bias.shape, dtype="float32")
             ctx.tvm_weight_dict[bias_t] = bias
+            ctx.refit_weight_dict[bias_t.name_hint] = bias.__torch2trt_weight_name
         new_attrs = {}
         new_attrs["channels"] = O
         new_attrs["kernel_size"] = ksize
@@ -225,6 +226,10 @@ def aten_batch_norm(inputs, attributes, scope):
         ctx.tvm_weight_dict[running_var_t] = running_var
         ctx.tvm_weight_dict[weight_t] = weight
         ctx.tvm_weight_dict[bias_t] = bias
+        ctx.refit_weight_dict[running_mean_t.name_hint] = inputs[3].__torch2trt_weight_name
+        ctx.refit_weight_dict[running_var_t.name_hint] = inputs[4].__torch2trt_weight_name
+        ctx.refit_weight_dict[weight_t.name_hint] = inputs[1].__torch2trt_weight_name
+        ctx.refit_weight_dict[bias_t.name_hint] = inputs[2].__torch2trt_weight_name
         new_attrs = {}
         new_attrs["axis"] = 1
         new_attrs["epsilon"] = eps
@@ -275,10 +280,11 @@ def aten_addmm(inputs, attributes, scope):
         weight_t = _expr.var(
             scope + "/weight", shape=weight.shape, dtype="float32")
         ctx.tvm_weight_dict[weight_t] = weight
-        if bias is not None:
-            bias_t = _expr.var(
-                scope + "/bias", shape=bias.shape, dtype="float32")
-            ctx.tvm_weight_dict[bias_t] = bias
+        ctx.refit_weight_dict[weight_t.name_hint] = inputs[2].__torch2trt_weight_name
+        bias_t = _expr.var(
+            scope + "/bias", shape=bias.shape, dtype="float32")
+        ctx.tvm_weight_dict[bias_t] = bias
+        ctx.refit_weight_dict[bias_t.name_hint] = inputs[0].__torch2trt_weight_name
         res = _op.nn.dense(inp, weight_t, units=C)
         res = _op.nn.bias_add(res, bias_t, axis=1)
         return [res]
@@ -316,6 +322,7 @@ def aten_matmul(inputs, attributes, scope):
         weight_t = _expr.var(
             scope + "/weight", shape=weight.shape, dtype="float32")
         ctx.tvm_weight_dict[weight_t] = weight
+        ctx.refit_weight_dict[weight_t.name_hint] = inputs[1].__torch2trt_weight_name
         res = _op.nn.dense(inputs[0], weight_t, units=C)
         return [res]
     res = torch.matmul(mat1, mat2)

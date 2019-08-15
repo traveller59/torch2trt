@@ -243,6 +243,6 @@ def aten_sum(inputs, attributes, scope):
 - [x] Deep integration between tensorrt and pytorch
   - [x] Add a TensorRTModule to support train in pytorch, eval in tensorrt
 - [ ] Add support for simple tensorrt plugin creation
-- [ ] Deep integration between tvm and pytorch
+- [x] Deep integration between tvm and pytorch
   - [x] Add TVM support
-  - [ ] Add a TVMModule to support train in pytorch, eval in tvm (impossible for now)
+  - [x] Add a TVMModule to support train in pytorch, eval in tvm

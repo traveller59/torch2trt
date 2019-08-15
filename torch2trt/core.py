@@ -15,7 +15,7 @@ from torch.jit import _unique_state_dict
 from torch.onnx.utils import \
     OperatorExportTypes  # must import this, otherwise error
 
-from torch2trt.utils import print_inputs, pretty_str
+from torch2trt.utils import print_inputs, pretty_str, get_torch_forward_name
 
 TVM_ENABLE = True 
 try:
@@ -606,6 +606,12 @@ def _torch_depoly(module,
         tvm_module: 
     """
     trace = torch.jit.trace(module, example_inputs, True)
+    if input_names is None:
+        if not isinstance(module, torch.nn.Module):
+            input_names = get_torch_forward_name(module)
+        else:
+            input_names = get_torch_forward_name(module.forward)
+
     if not isinstance(example_inputs, (list, tuple)):
         example_inputs = [example_inputs]
     is_class = isinstance(module, torch.nn.Module)

@@ -5,7 +5,15 @@ from torch import nn
 
 import torch2trt
 from torch2trt.inference.inference import TorchInferenceContext
-
+from torch2trt.utils import get_torch_forward_name
+from torch.utils import dlpack
+try:
+    import tvm 
+    from tvm.relay import expr, analysis
+    from tvm import relay
+    from tvm.contrib import graph_runtime
+except ImportError:
+    pass
 
 class TensorRTModule(nn.Module):
     def __init__(self,
@@ -34,6 +42,10 @@ class TensorRTModule(nn.Module):
         self.net_post_fn = net_post_fn
 
     def build_tensorrt(self, net, torch_inputs):
+        if self.input_names is None:
+            input_names = get_torch_forward_name(net.forward)
+        else:
+            input_names = self.input_names
         self.graph_pth = torch2trt.GraphModule(net, torch_inputs)
         self.output_names = []
         with trt.Builder(
@@ -47,10 +59,7 @@ class TensorRTModule(nn.Module):
             with torch2trt.trt_network(trt_net):
                 inputs = []
                 for i, arg in enumerate(torch_inputs):
-                    if self.input_names is not None:
-                        name = self.input_names[i]
-                    else:
-                        name = "input{}".format(i)
+                    name = input_names[i]
                     inp = trt_net.add_input(name=name,
                                             shape=arg.shape[1:],
                                             dtype=trt.float32)
@@ -209,10 +218,163 @@ class TensorRTModuleWrapper(TensorRTModule):
             return super().__call__(*args, **kw)
 
 
+class TVMInference:
+    def __init__(self, mod, params, ctx=None, input_names=None, cudnn=False, opt_level=3):
+        target = "cuda"
+        if cudnn:
+            target += " -libs=cudnn"
+        # target = 'llvm -mcpu=core-avx2'
+        with relay.build_config(opt_level=3):
+            graph, lib, params = relay.build(mod, target, params=params)
+        self.graph = graph
+        self.lib = lib
+        self.ctx = ctx or tvm.gpu(0)
+        # self.ctx = ctx or tvm.cpu()
+        self.tvm_context = graph_runtime.create(graph, lib, self.ctx)
+        self.params = params
+        self.tvm_context.set_input(**params)
+        self.input_names = input_names
+
+    def update_params(self, params):
+        self.params = params
+        self.tvm_context.set_input(**params)
+
+    def __call__(self, *args, **kw):
+        return self.inference(*args, **kw)
+
+    def inference(self, *args, **kw):
+        if self.input_names is None:
+            assert len(args) == 0 and len(kw) != 0
+            for k, v in kw.items():
+                self.tvm_context.set_input(k, tvm.nd.array(v, ctx=self.ctx))
+        else:
+            assert len(args) == len(self.input_names)
+            for k, v in zip(self.input_names, args):
+                self.tvm_context.set_input(k, tvm.nd.array(v, ctx=self.ctx))
+        self.tvm_context.run()
+        num_outputs = self.tvm_context.get_num_outputs()
+        outputs = []
+        for i in range(num_outputs):
+            outputs.append(self.tvm_context.get_output(i).asnumpy())
+        if len(outputs) == 1:
+            return outputs[0]
+        return tuple(outputs)
+
+    def inference_torch(self, *args, **kw):
+        if self.input_names is None:
+            assert len(args) == 0 and len(kw) != 0
+            for k, v in kw.items():
+                if isinstance(v, torch.Tensor):
+                    self.tvm_context.set_input(k, tvm.nd.from_dlpack(dlpack.to_dlpack(v)))
+                else:
+                    self.tvm_context.set_input(k, tvm.nd.array(v, ctx=self.ctx))
+        else:
+            assert len(args) == len(self.input_names)
+            for k, v in zip(self.input_names, args):
+                if isinstance(v, torch.Tensor):
+                    self.tvm_context.set_input(k, tvm.nd.from_dlpack(dlpack.to_dlpack(v)))
+                else:
+                    self.tvm_context.set_input(k, tvm.nd.array(v, ctx=self.ctx))
+        self.tvm_context.run()
+        num_outputs = self.tvm_context.get_num_outputs()
+        outputs = []
+        for i in range(num_outputs):
+            # outputs = [dlpack.from_dlpack(o) for o in outputs]
+            out = self.tvm_context.get_output(i).to_dlpack()
+            outputs.append(dlpack.from_dlpack(out))
+        if len(outputs) == 1:
+            return outputs[0]
+        return tuple(outputs)
+
+
 class TVMModule(nn.Module):
-    def __init__(self):
+    def __init__(self,
+                 graph_post_fn=None,
+                 input_names=None,
+                 verbose=False):
         super().__init__()
         self.built = False
         self.graph_pth = None
         self.refit_weight_dict = {}
-        self.tvm_ctx = None
+        self.ctx = None
+        self.output_names = None
+        # self.need_refit = True
+        self.verbose = verbose
+        self.input_names = input_names
+        self.params = None
+        self.graph_post_fn = graph_post_fn # can convert graph to quantized graph
+
+    def build_tvm(self, net, torch_inputs):
+        self.graph_pth = torch2trt.GraphModule(net, torch_inputs)
+        with torch2trt.core.tvm_network():
+            trace, graph_pth = torch2trt.core.torch2tvm(
+                net,
+                torch_inputs,
+                input_names=self.input_names,
+                verbose=self.verbose)
+        self.refit_weight_dict = graph_pth.refit_weight_dict
+        input_names = get_torch_forward_name(net.forward)
+        self.graph_pth = graph_pth
+        outputs = graph_pth.get_resolved_outputs()
+        tvm_weight_dict = graph_pth.context.tvm_weight_dict
+        self.params = {k.name_hint: v for k, v in tvm_weight_dict.items()}
+        print(len(self.params))
+        self.graph = expr.Function(analysis.free_vars(outputs), outputs)
+        if self.graph_post_fn is not None:
+            self.graph = self.graph_post_fn(self.graph)
+        self.ctx = TVMInference(self.graph, self.params, input_names=input_names, ctx=tvm.gpu(0), cudnn=True)
+
+    def refit_engine(self, net):
+        input_names = get_torch_forward_name(net.forward)
+        params = self.graph_pth.torch_weight_nodes_dict
+        params = {n: params[v].detach().cpu().numpy() for n, v in self.refit_weight_dict.items()}
+        self.params = params
+        self.ctx = TVMInference(self.graph, params, input_names=input_names, ctx=tvm.gpu(0), cudnn=True)
+
+    def __call__(self, *args, **kw):
+        if not self.training and not self.built:
+            self.build_tvm(self, args)
+            self.built = True
+            self.need_refit = False
+        if not self.training:
+            if self.need_refit:
+                self.refit_engine(self)
+                self.need_refit = False
+            assert all([a.is_cuda for a in args])
+            outputs = self.ctx.inference_torch(*args)
+            if len(outputs) == 1:
+                return outputs[0]
+            return tuple(outputs)
+        else:
+            self.need_refit = True
+            return super().__call__(*args, **kw)
+
+class TVMModuleWrapper(TVMModule):
+    def __init__(self,
+                net,
+                 graph_post_fn=None,
+                 input_names=None,
+                 verbose=False):
+        super().__init__(graph_post_fn, input_names, verbose)
+        self.net = net
+
+    def forward(self, *args, **kw):
+        return self.net.forward(*args, **kw)
+
+    def __call__(self, *args, **kw):
+        if not self.training and not self.built:
+            self.build_tvm(self.net, args)
+            self.built = True
+            self.need_refit = False
+        if not self.training:
+            if self.need_refit:
+                self.refit_engine(self.net)
+                self.need_refit = False
+            assert all([a.is_cuda for a in args])
+            outputs = self.ctx.inference_torch(*args)
+            if len(outputs) == 1:
+                return outputs[0]
+            return tuple(outputs)
+        else:
+            self.need_refit = True
+            return super().__call__(*args, **kw)

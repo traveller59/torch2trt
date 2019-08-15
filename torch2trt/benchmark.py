@@ -8,7 +8,7 @@ from tvm.contrib import graph_runtime
 import tvm
 from tvm.relay import expr, analysis
 from tvm import relay
-
+from torch2trt.utils import get_torch_forward_name
 
 def benchmark_trt_torch(net, input_shape=(1, 3, 224, 224)):
     net = net.float().cuda()
@@ -69,13 +69,12 @@ class TVMInferenceContext:
         return tuple(outputs)
 
 
-def benchmark_tvm(net, input_shape=(1, 3, 224, 224)):
+def benchmark_tvm_v1(net, input_shape=(1, 3, 224, 224)):
     inputs = torch.rand(*input_shape).float()
     with torch2trt.core.tvm_network():
         trace, graph_pth = torch2trt.core.torch2tvm(
             net,
             inputs,
-            input_names=["image"],
             verbose=True)
 
     outputs = graph_pth.get_resolved_outputs()
@@ -85,7 +84,7 @@ def benchmark_tvm(net, input_shape=(1, 3, 224, 224)):
     target = 'cuda -libs=cudnn'
     with relay.build_config(opt_level=3):
         graph, lib, params = relay.build(func, target, params=params)
-    ctx = TVMInferenceContext(graph, lib, params, tvm.gpu(0), ["image"])
+    ctx = TVMInferenceContext(graph, lib, params, tvm.gpu(0), ["x"])
     times = []
     ctx.inference_async(inputs.numpy())
     for i in range(100):
@@ -97,10 +96,30 @@ def benchmark_tvm(net, input_shape=(1, 3, 224, 224)):
 
     print("tvm time:", np.mean(times[2:]))
 
+def benchmark_tvm(net, input_shape=(1, 3, 224, 224)):
+    net = net.float().cuda()
+    net_trt = torch2trt.TVMModuleWrapper(
+        net,
+        verbose=True).eval()
+    net_trt = net_trt.float().cuda()
+    inputs = torch.rand(*input_shape).float().cuda()
+    out = net_trt(inputs)  # build trt engine
+    times = []
+    for i in range(100):
+        torch.cuda.synchronize()
+        t = time.time()
+        out = net_trt(inputs)
+        torch.cuda.synchronize()
+        times.append(time.time() - t)
+
+    print("tvm time:", np.mean(times[2:]))
+
+
+
 if __name__ == "__main__":
     # net = torchvision.models.inception_v3(pretrained=True).eval()
     # net = torchvision.models.vgg19_bn(pretrained=True).eval()
-    net = torchvision.models.resnext50_32x4d(pretrained=False).eval()
+    net = torchvision.models.resnet18(pretrained=False).eval()
     # net = torchvision.models.squeezenet1_1(pretrained=True).eval()
     # benchmark_trt_torch(net, [1, 3, 224, 224])
-    benchmark_trt_torch(net, [1, 3, 224, 224])
+    benchmark_tvm(net, [1, 3, 224, 224])
