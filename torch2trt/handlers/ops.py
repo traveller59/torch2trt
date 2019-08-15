@@ -59,6 +59,20 @@ def aten_view(inputs, attributes, scope):
         return [_op.reshape(inputs[0], newshape=inputs[1])]
     return [inputs[0].view(*inputs[1])]
 
+@register_node_handler("aten::clone")
+def aten_clone(inputs, attributes, scope):
+    ctx = current_context()
+    net = current_context().network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
+        layer = net.add_identity(inputs[0])
+        output = layer.get_output(0)
+        layer.name = scope
+        output.name = scope
+        return [output]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        raise NotImplementedError
+    return [inputs[0].clone()]
+
 @register_node_handler("aten::flatten")
 def aten_flatten(inputs, attributes, scope):
     inp, start_dim, end_dim = inputs[:3]

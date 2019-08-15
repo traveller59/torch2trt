@@ -444,6 +444,14 @@ def _make_unique_name(unique_set, name, max_count=10000):
             return new_name
     raise ValueError("max count reached")
 
+class UniqueNamePool:
+    def __init__(self, max_count=10000):
+        self.max_count = max_count
+        self.unique_set = set()
+
+    def __call__(self, name):
+        return _make_unique_name(self.unique_set, name)
+
 
 def parse(graph, num_inputs, omit_useless_nodes=False, is_class=False):
     """This method parses an optimized PyTorch model graph and produces
@@ -482,7 +490,7 @@ def parse(graph, num_inputs, omit_useless_nodes=False, is_class=False):
 
     # assign a readable name to each node
     output_names = graph_py.get_output_names()
-    unique_name_set = set()
+    name_pool = UniqueNamePool()
     for output_name in output_names:
         out_to_node = graph_py.get_out_to_node()
         out_node = out_to_node[output_name]
@@ -493,8 +501,10 @@ def parse(graph, num_inputs, omit_useless_nodes=False, is_class=False):
                         name = node.scopeName + "/" + node.kind
                     else:
                         name = node.kind
-                    node.readable_unique_name = _make_unique_name(
-                        unique_name_set, name)
+                    node.readable_unique_name = name_pool(name)
+                    node.readable_unique_name = node.readable_unique_name.replace(":", "_")
+                    node.readable_unique_name = node.readable_unique_name.replace("/", ".")
+                    # node.readable_unique_name = name_pool("layer")
                     graph_py.readable_name_to_node[name] = node
                 else:
                     return
@@ -505,13 +515,6 @@ def parse(graph, num_inputs, omit_useless_nodes=False, is_class=False):
         recursive_assign_name(out_node)
     return graph_py
 
-class UniqueNamePool:
-    def __init__(self, max_count=10000):
-        self.max_count = max_count
-        self.unique_set = set()
-
-    def __call__(self, name):
-        return _make_unique_name(self.unique_set, name)
 
 def resolve_graph(graph_py: GraphPy, output_names, verbose=False):
     ctx = current_context()

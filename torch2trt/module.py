@@ -12,6 +12,9 @@ class TensorRTModule(nn.Module):
                  max_batchsize,
                  workspace,
                  dtype=trt.float32,
+                 builder_config_fn=None,
+                 net_post_fn=None,
+                 input_names=None,
                  verbose=False):
         super().__init__()
         self.max_batchsize = max_batchsize
@@ -26,6 +29,9 @@ class TensorRTModule(nn.Module):
         self.output_names = None
         self.need_refit = False
         self.verbose = verbose
+        self.builder_config_fn = builder_config_fn
+        self.input_names = input_names
+        self.net_post_fn = net_post_fn
 
     def build_tensorrt(self, net, torch_inputs):
         self.graph_pth = torch2trt.GraphModule(net, torch_inputs)
@@ -34,14 +40,20 @@ class TensorRTModule(nn.Module):
                 self.logger) as builder, builder.create_network() as trt_net:
             builder.max_workspace_size = self.workspace
             builder.max_batch_size = self.max_batchsize
-            builder.refittable = True
+            builder.fp16_mode = builder.platform_has_fast_fp16
+            # builder.refittable = False
+            if self.builder_config_fn is not None:
+                self.builder_config_fn(builder)
             with torch2trt.trt_network(trt_net):
                 inputs = []
                 for i, arg in enumerate(torch_inputs):
-                    inp = trt_net.add_input(
-                        name="input{}".format(i),
-                        shape=arg.shape[1:],
-                        dtype=trt.float32)
+                    if self.input_names is not None:
+                        name = self.input_names[i]
+                    else:
+                        name = "input{}".format(i)
+                    inp = trt_net.add_input(name=name,
+                                            shape=arg.shape[1:],
+                                            dtype=trt.float32)
                     inputs.append(inp)
                 outputs = self.graph_pth(*inputs, verbose=self.verbose)
             self.refit_weight_dict = self.graph_pth.graph.refit_weight_dict
@@ -53,6 +65,8 @@ class TensorRTModule(nn.Module):
                 self.output_names.append(name)
                 trt_net.mark_output(tensor=out)
             self.builder = builder
+            if self.net_post_fn is not None:
+                self.net_post_fn(trt_net)
             self.engine = builder.build_cuda_engine(trt_net)
             self.ctx = self.engine.create_execution_context()
             self.ctx = torch2trt.TorchInferenceContext(self.ctx)
@@ -65,7 +79,9 @@ class TensorRTModule(nn.Module):
             self.output_shapes[n] = v.shape[1:]
 
     def refit_engine(self, net):
-        print("TensorRT refit seems not working with batchnorm. so disable it for now.")
+        print(
+            "TensorRT refit seems not working with batchnorm. so disable it for now."
+        )
         raise NotImplementedError
         variables = []
         with trt.Refitter(self.engine, self.logger) as refitter:
@@ -155,8 +171,12 @@ class TensorRTModuleWrapper(TensorRTModule):
                  max_batchsize,
                  workspace,
                  dtype=trt.float32,
+                 builder_config_fn=None,
+                 net_post_fn=None,
+                 input_names=None,
                  verbose=False):
-        super().__init__(max_batchsize, workspace, dtype, verbose)
+        super().__init__(max_batchsize, workspace, dtype, builder_config_fn,
+                         net_post_fn, input_names, verbose)
         self.net = net
 
     def forward(self, *args, **kw):
