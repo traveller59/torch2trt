@@ -8,7 +8,7 @@ import torch
 
 
 class InferenceContext:
-    def __init__(self, context: trt.IExecutionContext, stream=None):
+    def __init__(self, context: trt.IExecutionContext, stream=None, cuda_device=None, cuda_context=None):
         self.engine = context.engine
         inputs, outputs, bindings = allocate_buffers(self.engine)
         self.context = context
@@ -20,10 +20,22 @@ class InferenceContext:
         if stream is None:
             self.stream = cuda.Stream()
         self._batch_size = None
+        self.cuda_device = cuda_device
+        self.cuda_context = cuda_context
 
     @property
     def max_batch_size(self):
         return self.engine.max_batch_size
+
+    @contextlib.contextmanager
+    def device(self):
+        if self.cuda_context is not None:
+            self.cuda_context.push()
+            yield 
+            self.cuda_context.pop()
+        else:
+            yield
+
 
     @contextlib.contextmanager
     def inference_io(self, *inputs, **kwargs):
@@ -116,9 +128,10 @@ class InferenceContext:
         Returns:
             outputs: dict of name to output array
         """
-        with self.inference_io(*inputs, **kwargs):
-            assert self._batch_size is not None
-            return self.execute(self._batch_size)
+        with self.device():
+            with self.inference_io(*inputs, **kwargs):
+                assert self._batch_size is not None
+                return self.execute(self._batch_size)
 
     def inference_async(self, *inputs, **kwargs):
         """do inference.
@@ -128,9 +141,10 @@ class InferenceContext:
         Returns:
             outputs: dict of name to output array
         """
-        with self.inference_io(*inputs, **kwargs):
-            assert self._batch_size is not None
-            return self.execute_async(self._batch_size)
+        with self.device():
+            with self.inference_io(*inputs, **kwargs):
+                assert self._batch_size is not None
+                return self.execute_async(self._batch_size)
 
 
 class TorchInferenceContext(InferenceContext):
