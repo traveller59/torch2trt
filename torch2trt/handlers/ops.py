@@ -1128,13 +1128,13 @@ def aten_repeat(inputs, attributes, scope):
     if ctx.is_tensorrt and has_trt_tensor(inputs):
         assert params[0] == 1
         assert len(params) > 1
-        assert len(params) == len(inp.shape) + 1
+        # assert len(params) == len(inp.shape) + 1
         # implement repeat by several gather operation, slower than native repeat
         i = 0
         for p, s in zip(params[1:], inp.shape):
             if p > 1:
                 repeat_weights = np.tile(np.arange(0, s), [p]).astype(np.int32)
-                layer = net.add_constant([1, s * p],
+                layer = net.add_constant([s * p],
                                          trt.Weights(repeat_weights))
                 layer.name = scope + "/" + "constant_{}".format(i)
                 gather_inds = layer.get_output(0)
