@@ -34,7 +34,6 @@ def aten_size(inputs, attributes, scope):
         return [inp_shape[axis]]
     return [inputs[0].shape[inputs[1]]]
 
-
 @register_node_handler("aten::view")
 def aten_view(inputs, attributes, scope):
     assert len(inputs) == 2
@@ -114,7 +113,16 @@ def aten_convolution(inputs, attributes, scope):
         assert all([e == 0 for e in output_padding
                     ]), "tensor rt don't support out padding"
         ndim = len(ksize)
-        assert ndim == 2, "tensorrt only support 2d conv"
+        if ndim == 1:
+            print("WARNING: consider write conv2d because trt don't support conv2d, we need to change input shape (and output shape) and may cause error in following layers.")
+            ksize = [ksize[0], 1]
+            stride = [stride[0], 1]
+            pad = [pad[0], 0]
+            dilation = [dilation[0], 1]
+        if len(inputs[0].shape) == 2:
+            inputs[0] = _trt_reshape(net, inputs[0], [*inputs[0].shape, 1], scope + "/conv1d_reshape")
+
+        assert ndim <= 2, "tensorrt only support 1d/2d conv"
         # trt weight format: GKCRS: [num_groups, O_groups, I, H, W]
         weight = weight.detach().cpu().numpy()
         if bias is not None:
@@ -173,12 +181,20 @@ def aten_convolution(inputs, attributes, scope):
             res = _op.nn.bias_add(res, bias_t, axis=1)
         return [res]
     ndim = len(inputs[3])
-    assert ndim == 2
-    if transposed:
-        res = F.conv_transpose2d(inp, weight, bias, stride, pad,
-                                 output_padding, groups, dilation)
+    assert ndim <= 2
+    if ndim == 1:
+        if transposed:
+            res = F.conv_transpose1d(inp, weight, bias, stride, pad,
+                                    output_padding, groups, dilation)
+        else:
+            res = F.conv1d(inp, weight, bias, stride, pad, dilation, groups)
     else:
-        res = F.conv2d(inp, weight, bias, stride, pad, dilation, groups)
+        if transposed:
+            res = F.conv_transpose2d(inp, weight, bias, stride, pad,
+                                    output_padding, groups, dilation)
+        else:
+            res = F.conv2d(inp, weight, bias, stride, pad, dilation, groups)
+
     return [res]
 
 
@@ -857,6 +873,28 @@ def aten_sum(inputs, attributes, scope):
         return [_op.reduce.sum(inp, dim, keepdims=bool(keepdim))]
 
     return [inp.sum(dim, keepdim=bool(keepdim))]
+
+
+@register_node_handler("aten::topk")
+def aten_topk(inputs, attributes, scope):
+    inp, k, dim = inputs[:3]
+    ctx = current_context()
+    net = ctx.network
+    if ctx.is_tensorrt and has_trt_tensor(inputs):
+        if not isinstance(dim, list):
+            dim = [dim]
+        axis_trt = _axes_to_trt_axis(dim, len(inp.shape))
+        layer = net.add_topk(inp, trt.TopKOperation.MAX, k, axis_trt)
+        output0 = layer.get_output(0)
+        output1 = layer.get_output(1)
+        output0.name = scope + "_val"
+        output1.name = scope + "_inds"
+        layer.name = scope
+        return [output0, output1]
+    elif ctx.is_tvm and has_tvm_tensor(inputs):
+        raise NotImplementedError
+
+    return inp.topk(k, dim)
 
 
 @register_node_handler("aten::max")

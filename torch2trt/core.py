@@ -112,7 +112,7 @@ def register_node_handler(name):
 def get_node_handler(name):
     global REGISTERED_NODE_HANDLERS
     msg = "missing handler " + name
-    msg += f", available handlers: {REGISTERED_NODE_HANDLERS.keys()}"
+    msg += ", available handlers: {}".format(list(REGISTERED_NODE_HANDLERS.keys()))
     assert name in REGISTERED_NODE_HANDLERS, msg
     return REGISTERED_NODE_HANDLERS[name]
 
@@ -563,8 +563,8 @@ def resolve_graph(graph_py: GraphPy, output_names, verbose=False):
                 if verbose:
                     print(msg)
                 raise e
-            assert isinstance(results, (list, tuple)), f"{node.kind}"
-            assert len(results) == len(node.resolved_outputs), f"{node.kind}"
+            assert isinstance(results, (list, tuple)), node.kind
+            assert len(results) == len(node.resolved_outputs), node.kind
             if verbose:
                 if have_tensor(inputs) and have_tensor(results):
                     msg += pretty_str(results)

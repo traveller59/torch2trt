@@ -115,11 +115,31 @@ def benchmark_tvm(net, input_shape=(1, 3, 224, 224)):
     print("tvm time:", np.mean(times[2:]))
 
 
+from torch import nn 
+class TopkTest(nn.Module):
+    def forward(self, x):
+        return x.topk(1, -1)
+
+def test():
+    net = TopkTest()
+    net_trt = torch2trt.TensorRTModuleWrapper(
+        net,
+        1,
+        1 << 30,
+        verbose=True).eval()
+    net_trt = net_trt.float().cuda()
+    x = torch.rand(1, 200, 100).float().cuda()
+    import codeai 
+    codeai.prettyprint(net_trt(x)[1].cpu().numpy())
+    # print( net_trt(x)[1].cpu().numpy() - net(x)[1].cpu().numpy() )
+
+
 
 if __name__ == "__main__":
+    test()
     # net = torchvision.models.inception_v3(pretrained=True).eval()
     # net = torchvision.models.vgg19_bn(pretrained=True).eval()
-    net = torchvision.models.resnet18(pretrained=False).eval()
+    # net = torchvision.models.resnet18(pretrained=False).eval()
     # net = torchvision.models.squeezenet1_1(pretrained=True).eval()
     # benchmark_trt_torch(net, [1, 3, 224, 224])
-    benchmark_tvm(net, [1, 3, 224, 224])
+    # benchmark_tvm(net, [1, 3, 224, 224])
