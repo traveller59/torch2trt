@@ -150,7 +150,7 @@ class InferenceContext:
 class TorchInferenceContext(InferenceContext):
     """same as InferenceContext except this class always take and return torch cuda tensor.
     """
-    def __init__(self, context: trt.IExecutionContext, stream=None, device=None):
+    def __init__(self, context: trt.IExecutionContext, stream=None, device=None, cuda_device=None, cuda_context=None):
         self.engine = context.engine
         if device is None:
             self.torch_device = torch.device("cuda:0")
@@ -166,6 +166,8 @@ class TorchInferenceContext(InferenceContext):
         if stream is None:
             self.stream = cuda.Stream()
         self._batch_size = None
+        self.cuda_device = cuda_device
+        self.cuda_context = cuda_context
 
     def execute_async(self, batch_size):
         assert all([inp.device_input for inp in self.inputs]), "all input must be cuda tensor"
