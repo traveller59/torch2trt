@@ -153,10 +153,10 @@ class TorchInferenceContext(InferenceContext):
     def __init__(self, context: trt.IExecutionContext, stream=None, device=None):
         self.engine = context.engine
         if device is None:
-            self.device = torch.device("cuda:0")
+            self.torch_device = torch.device("cuda:0")
         else:
-            self.device = device
-        inputs, outputs, bindings = allocate_buffers_torch(self.engine, self.device)
+            self.torch_device = device
+        inputs, outputs, bindings = allocate_buffers_torch(self.engine, self.torch_device)
         self.context = context
         self.inputs = inputs
         self.outputs = outputs
